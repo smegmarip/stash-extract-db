@@ -1,6 +1,6 @@
 # stash-extract-db
 
-A bridge service between [Stash](https://stashapp.cc) and the [Site Extractor](../../experiments/site-extractor) that lets a single Stash scraper resolve a scene to extractor-side metadata. Supports both **search** mode (ranked candidates) and **scrape** mode (single definitive match or empty).
+A bridge service for [Stash](https://stashapp.cc) that lets a single Stash scraper resolve a scene to extractor-side metadata. Supports both **search** mode (ranked candidates) and **scrape** mode (single definitive match or empty).
 
 > See [`requirements.md`](requirements.md) for the full functional spec and [`CLAUDE.md`](CLAUDE.md) for architectural invariants.
 
@@ -26,6 +26,7 @@ pip install -r ~/.stash/scrapers/stash-extract-db/requirements.txt
 ## How it works
 
 For each scene the user invokes the scraper on:
+
 1. The scraper script reads the scene fragment from stdin and forwards it (plus user config) to the bridge.
 2. The bridge pulls the scene from Stash via GraphQL, lists completed extractor jobs, filters to scene-shaped schemas, narrows by studio, and runs the heuristic engine.
 3. The bridge returns Stash scraper-shaped JSON (single result for scrape, ranked list for search).
