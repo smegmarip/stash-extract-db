@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Stash Extract DB — scraper script.
+"""Stash Extract Scraper — scraper script.
 
 Stdlib-only transport adapter. Reads scraper input from stdin, calls the
 bridge service, writes the bridge's JSON response to stdout. The bridge
@@ -52,7 +52,8 @@ def _post(endpoint: str, body: dict) -> str:
     url = config.BRIDGE_URL.rstrip("/") + endpoint
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(
-        url, data=data,
+        url,
+        data=data,
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )

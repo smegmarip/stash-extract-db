@@ -17,9 +17,9 @@ docker compose up -d --build
 curl http://localhost:13000/health
 
 # 3. Stash scraper
-cp -r stash/ ~/.stash/scrapers/stash-extract-db/      # adjust path for your install
-$EDITOR ~/.stash/scrapers/stash-extract-db/config.py  # set BRIDGE_URL
-pip install -r ~/.stash/scrapers/stash-extract-db/requirements.txt
+cp -r stash-extract-scraper/ ~/.stash/scrapers/stash-extract-scraper/      # adjust path for your install
+$EDITOR ~/.stash/scrapers/stash-extract-scraper/config.py  # set BRIDGE_URL
+pip install -r ~/.stash/scrapers/stash-extract-scraper/requirements.txt
 # Stash → Settings → Scrapers → Reload Scrapers
 ```
 

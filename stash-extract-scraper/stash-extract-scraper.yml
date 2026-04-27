@@ -1,4 +1,4 @@
-name: "Stash Extract DB"
+name: "Stash Extract Scraper"
 
 # Definitive scrape on the user's "Scrape With" action against a scene.
 sceneByFragment:
