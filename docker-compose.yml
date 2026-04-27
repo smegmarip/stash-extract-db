@@ -21,4 +21,5 @@ services:
 
 networks:
   extractor_network:
+    name: ${DOCKER_NETWORK:-extractor_network}
     external: true
