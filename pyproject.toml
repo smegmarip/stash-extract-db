@@ -1,0 +1,21 @@
+[project]
+name = "stash-extract-db"
+version = "0.1.0"
+description = "Bridge between Stash and Site Extractor for scene metadata matching"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "httpx>=0.28",
+    "aiosqlite>=0.20",
+    "pydantic>=2.9",
+    "rapidfuzz>=3.10",
+    "imagehash>=4.3",
+    "Pillow>=11.0",
+    "numpy>=2.1",
+    "pydantic-settings>=2.6",
+    "guessit>=3.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["bridge"]
