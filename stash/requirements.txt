@@ -1,0 +1,2 @@
+# scraper.py uses Python stdlib only — no third-party deps required.
+# This file exists so the install instructions are uniform across scrapers.

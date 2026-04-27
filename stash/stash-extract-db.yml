@@ -1,0 +1,37 @@
+name: "Stash Extract DB"
+
+# Definitive scrape on the user's "Scrape With" action against a scene.
+sceneByFragment:
+  action: script
+  script:
+    - python3
+    - scraper.py
+    - fragment
+
+# Search by free-text name (returns a ranked list for the user to pick).
+sceneByName:
+  action: script
+  script:
+    - python3
+    - scraper.py
+    - name
+
+# After the user picks a search result, Stash invokes this to get the
+# definitive scrape for the chosen candidate.
+sceneByQueryFragment:
+  action: script
+  script:
+    - python3
+    - scraper.py
+    - query
+
+# Scrape by URL — used when a scene already has a URL set and the user
+# triggers "Scrape from URL". Edit the `url` list to scope to your sources.
+sceneByURL:
+  - action: script
+    url:
+      - "http"
+    script:
+      - python3
+      - scraper.py
+      - url
