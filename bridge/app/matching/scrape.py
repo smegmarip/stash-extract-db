@@ -7,7 +7,7 @@ import logging
 from typing import Any, Optional
 
 from .text import studio_and_code_fires, exact_title_fires
-from .image_match import per_extractor_image_sims, aggregate_scrape
+from .image_match import all_pair_sims, aggregate_scrape
 
 logger = logging.getLogger(__name__)
 
@@ -45,11 +45,11 @@ async def scrape(
     # over records with one or two borderline matches (CLAUDE.md §13).
     matches: list[tuple[dict[str, Any], float]] = []
     for c in candidates:
-        sims = await per_extractor_image_sims(
+        sims, n_images = await all_pair_sims(
             scene, c["job_id"], c["data"], image_mode,
             algorithm, hash_size, sprite_sample_size,
         )
-        score = aggregate_scrape(sims, threshold)
+        score = aggregate_scrape(sims, n_images, threshold)
         if score > 0:
             matches.append((c, score))
     if matches:

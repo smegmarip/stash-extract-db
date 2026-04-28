@@ -184,7 +184,7 @@ def _sim(h_a, h_b, hash_size: int) -> float:
         return 0.0
 
 
-async def per_extractor_image_sims(
+async def all_pair_sims(
     scene: dict[str, Any],
     job_id: str,
     record: dict[str, Any],
@@ -192,44 +192,41 @@ async def per_extractor_image_sims(
     algorithm: str,
     hash_size: int,
     sprite_sample_size: int,
-) -> list[float]:
-    """For each extractor image (cover_image + images[], deduped), return
-    the best similarity against the configured Stash-side image set:
+) -> tuple[list[float], int]:
+    """Compute every pair similarity between the configured Stash-side hash
+    set and the record's extractor images. Returns (flat_sims, n_images).
 
-      - cover  → Stash-side set is {screenshot}                  (1)
-      - sprite → Stash-side set is {sprite frame 1..M}           (M)
-      - both   → Stash-side set is {screenshot, frame 1..M}      (M+1)
+    Stash-side hash set per `image_mode`:
+      - cover  → {screenshot}                  (1)
+      - sprite → {sprite frame 1..M}           (M)
+      - both   → {screenshot, frame 1..M}      (M+1)
 
-    Result length == number of *usable* extractor image refs — we drop
-    refs whose hash is None (404, fetch error, low-variance image — see
-    `_hash_or_compute`) and refs whose hash is degenerate (all-black /
-    all-white / near-uniform — see `_is_degenerate_hash`). Stash-side
-    degenerate frames are filtered the same way. The goal is "signal
-    only": every entry in the returned list is a real comparison between
-    two images that carry visual information.
+    Extractor side: cover_image + images[] (deduped). Both sides are
+    filtered for degenerate / 404 / low-variance hashes (CLAUDE.md §13).
 
-    Each entry is the max similarity against the Stash-side set for that
-    extractor image. This per-image array is the input to the
-    distribution-sensitive aggregation (see aggregate_search /
-    aggregate_scrape).
+    `flat_sims` length == |Stash side| × |extractor side| pairs (not
+    collapsed per-image). The full pair distribution is the input to the
+    distribution-sensitive aggregation — `_top_k_mean` with K = n_images.
 
-    Per CLAUDE.md §13: rewards records with multiple strong matches over
-    records with many mediocre matches; soft-OR aggregation lifts a single
-    high-similarity hit to dominance regardless of weak siblings — which
-    is exactly why we have to reject degenerate sources here. Two
-    all-black images would otherwise match at sim=1.0 and saturate
-    soft-OR, producing an agg=1.0 false-positive scrape result.
+    `n_images` is returned alongside because aggregation needs it as K.
     """
     refs: list[str] = list(record.get("images") or [])
     cover_ref = record.get("cover_image")
     if cover_ref and cover_ref not in refs:
         refs = [cover_ref] + refs
     if not refs:
-        return []
+        return [], 0
 
-    # Build Stash-side hash set once per scene+mode. Drop None and
-    # degenerate hashes — these contribute no usable signal and can
-    # collide spuriously.
+    extractor_hashes: list = []
+    for ref in refs:
+        eh = await extractor_image_hash(job_id, ref, algorithm, hash_size)
+        if eh is None or _is_degenerate_hash(eh):
+            # 404, low-variance, or degenerate — drop from comparison set.
+            continue
+        extractor_hashes.append(eh)
+    if not extractor_hashes:
+        return [], 0
+
     stash_hashes: list = []
     if image_mode in ("cover", "both"):
         c = await stash_cover_hash(scene, algorithm, hash_size)
@@ -240,74 +237,49 @@ async def per_extractor_image_sims(
             if sh is not None and not _is_degenerate_hash(sh):
                 stash_hashes.append(sh)
     if not stash_hashes:
-        return []
+        return [], len(extractor_hashes)
 
     sims: list[float] = []
-    for ref in refs:
-        eh = await extractor_image_hash(job_id, ref, algorithm, hash_size)
-        if eh is None or _is_degenerate_hash(eh):
-            # 404, low-variance, or degenerate — drop from sims entirely.
-            # Soft-OR is unchanged by zeros, but listing them in debug is
-            # noise; an absent entry says "no comparison happened here".
-            continue
-        best = 0.0
-        for sh in stash_hashes:
-            s = _sim(sh, eh, hash_size)
-            if s > best:
-                best = s
-        sims.append(best)
-    return sims
+    for sh in stash_hashes:
+        for eh in extractor_hashes:
+            sims.append(_sim(sh, eh, hash_size))
+    return sims, len(extractor_hashes)
 
 
-def soft_or(sims: list[float]) -> float:
-    """Probabilistic OR — `1 - prod(1 - s)`.
+def _top_k_mean(sims: list[float], k: int) -> float:
+    """Mean of the top-K values from `sims`, sorted descending. K is
+    clamped to [1, len(sims)]. Bounded [0, 1].
 
-    Properties (per CLAUDE.md §13):
-      - Bounded [0, 1]; saturates at 1.0 when any sim hits 1.0.
-      - Distribution-sensitive: multiple weak matches accumulate, but a
-        single strong match dominates.
-      - Monotonic in every component sim.
+    Distribution-sensitive: uses the upper tail rather than the full
+    distribution — single-outlier values can't dominate, but multiple
+    high values get full credit. A record with one spurious 1.0 sim
+    surrounded by weak ones scores low because the K-1 trailing terms
+    drag the mean down; a record with K consistently strong sims scores
+    high because every term is large.
 
-    Example: sims=[0.1,0.1,0.1,1.0] → 1.0;  sims=[0.13,0.13,0.13,0.13] → 0.427
+    See CLAUDE.md §13 for the dispatch rule on K. Short version:
+    K = number of distinct extractor images participating, because we
+    want one strong match per extractor image as the "all images
+    accounted for" benchmark.
     """
     if not sims:
         return 0.0
-    p = 1.0
-    for s in sims:
-        if s < 0.0:
-            s = 0.0
-        elif s > 1.0:
-            s = 1.0
-        p *= (1.0 - s)
-    return 1.0 - p
+    k = max(1, min(k, len(sims)))
+    return sum(sorted(sims, reverse=True)[:k]) / k
 
 
-def aggregate_search(sims: list[float]) -> float:
-    """Search-mode aggregation — every per-image sim contributes (no threshold)."""
-    return soft_or(sims)
+def aggregate_search(sims: list[float], n_images: int) -> float:
+    """Search-mode: top-K mean over the full M×N pair set (no threshold gate)."""
+    return _top_k_mean(sims, n_images)
 
 
-def aggregate_scrape(sims: list[float], threshold: float) -> float:
-    """Scrape-mode aggregation — only above-threshold sims contribute. Returns
-    0.0 when no extractor image clears the threshold (the candidate doesn't
-    fire the image tier)."""
-    above = [s for s in sims if s >= threshold]
-    return soft_or(above)
+def aggregate_scrape(sims: list[float], n_images: int, threshold: float) -> float:
+    """Scrape-mode: top-K mean over the full M×N pair set; fires only when
+    the aggregate clears the threshold. The threshold now gates the
+    *aggregate*, not individual pair sims — this is what kills the
+    one-outlier false positive: a single 1.0 in a sea of low sims won't
+    push the aggregate over the threshold."""
+    score = _top_k_mean(sims, n_images)
+    return score if score >= threshold else 0.0
 
 
-# Back-compat thin wrapper — returns the simple max similarity. Kept only for
-# any caller that still wants the old single-number signal; new code should
-# use per_extractor_image_sims + aggregate_*.
-async def best_image_similarity(
-    scene: dict[str, Any],
-    job_id: str,
-    record: dict[str, Any],
-    image_mode: str,
-    algorithm: str,
-    hash_size: int,
-    sprite_sample_size: int,
-) -> float:
-    sims = await per_extractor_image_sims(
-        scene, job_id, record, image_mode, algorithm, hash_size, sprite_sample_size,
-    )
-    return max(sims) if sims else 0.0

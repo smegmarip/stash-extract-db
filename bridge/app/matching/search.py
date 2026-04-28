@@ -21,7 +21,7 @@ from .text import (
     date_score, performer_score,
 )
 from .filename import filename_score, filename_score_debug
-from .image_match import per_extractor_image_sims, aggregate_search
+from .image_match import all_pair_sims, aggregate_search
 
 logger = logging.getLogger(__name__)
 
@@ -63,11 +63,11 @@ async def search(
         if et_fires:
             score += 1.0
 
-        sims = await per_extractor_image_sims(
+        sims, n_images = await all_pair_sims(
             scene, c["job_id"], rec, image_mode,
             algorithm, hash_size, sprite_sample_size,
         )
-        image_contrib = aggregate_search(sims)
+        image_contrib = aggregate_search(sims, n_images)
         score += image_contrib
 
         if debug:
@@ -93,8 +93,10 @@ async def search(
                 "exact_title": et_fires,
                 "image": {
                     "mode": image_mode,
-                    "per_extractor_image_sims": [round(s, 4) for s in sims],
-                    "aggregation": "soft_or",
+                    "n_images": n_images,
+                    "n_pairs": len(sims),
+                    "all_pair_sims": [round(s, 4) for s in sorted(sims, reverse=True)[:20]],
+                    "aggregation": f"top_k_mean (K={n_images})",
                     "score": round(image_contrib, 4),
                 },
                 "image_contribution": round(image_contrib, 4),

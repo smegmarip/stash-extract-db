@@ -166,23 +166,57 @@ The full breakdown is observable via `?debug=1` on `/match/*` endpoints (search 
 
 ---
 
-## 13. Image scores are aggregated distribution-sensitively (soft-OR), never collapsed to max
+## 13. Image scores are aggregated as `top-K mean over the flat M×N pair set`, with K = number of extractor images
 
-> **Per-extractor-image best-match sims are computed first; then aggregated. The aggregation rewards both peak strength and number of matches.**
+> **Every Stash-side hash compared against every extractor-side hash. The flat M×N similarity set is then aggregated by taking the mean of the top K values, where K is the number of usable extractor images. Threshold gates the *aggregate*, not individual pair sims.**
 
-Exact image matches between independently-encoded scenes are rare. A scene that genuinely matches an extractor record will typically produce multiple medium-to-strong similarities across that record's image set, while an unrelated scene will produce a flat distribution of low scores even with many images.
+Exact image matches between independently-encoded scenes are rare. A scene that genuinely matches an extractor record produces multiple medium-to-strong similarities scattered through the M×N pair grid; an unrelated scene produces a flat distribution of low values with the occasional spurious outlier (hash collision, shared decorative asset, etc.). The aggregation must distinguish "K consistent strong pairs" (real match) from "one outlier strong pair + many weak" (false positive).
 
-Concrete: a record with `[0.1, 0.1, 0.1, 1.0]` outranks one with `[0.13, 0.13, 0.13, 0.13]`, despite the second having a higher mean and the same `max(sim) - mean(sim)` spread. Distribution-sensitive aggregation captures this; `max()` alone would tie them at 1.0 vs 0.13 (still right here) but loses information when no perfect match exists.
+### The aggregation: `top_k_mean(sims, k=N)` where N = |extractor images|
 
-The aggregation is **soft-OR** (`1 - prod(1 - s for s in sims)`):
-- Bounded `[0, 1]` so it composes cleanly with the search score (`+= contribution`, capped at 1.0).
-- Saturates at 1.0 when any sim is 1.0 — a perfect match dominates regardless of weak siblings.
-- Multiple weak matches accumulate but never overwhelm a single strong match.
-- Symmetric in input order; deterministic.
+```
+score = mean(sorted(sims, reverse=True)[:N])
+```
 
-For sprite mode (`M` Stash sprite frames × `N` extractor images), we collapse the M×N matrix **per extractor image** — for each extractor image, the best matching Stash sprite frame is its score. Aggregation then runs over those `N` per-image scores, mirroring cover mode's structure. We do **not** flatten all M×N pairs into one bag — that would let many weak frame-image pairs accumulate spurious signal.
+- Bounded `[0, 1]` — composes cleanly with the search score (`+= contribution`, capped at 1.0).
+- For each extractor image, you'd hope to see at least one strong sprite-frame match in a real match. Top-N picks the N best pairs in the entire grid as the record's strongest evidence; mean averages them.
 
-**Don't**: replace soft-OR with arithmetic or geometric mean — both lose the "one strong match dominates" property. **Don't**: aggregate over Stash-side dimensions (frames) — only over extractor images. **Don't**: skip the per-image step and pre-flatten — the distribution would dissolve into a single max.
+### Worked examples
+
+Real match (M=8 sprite frames × N=5 extractor images = 40 pairs; ~5 strong pairs at 0.85, ~35 weak at 0.15):
+- top-5 ≈ [0.85, 0.85, 0.85, 0.85, 0.85] → **0.85**
+
+False match (one shared/coincident image hashing identically to one sprite frame; the rest of the record's images are unrelated):
+- top-5 = [1.0, 0.15, 0.15, 0.15, 0.15] → **0.36**
+
+A 0.5 threshold then admits the real match and rejects the false. Note the threshold is on the **aggregate**, not on individual pair sims — that's what kills the one-outlier false positive.
+
+### Why we ditched the previous strategies
+
+- **Per-extractor-image collapse + peak+mean** (previous attempt): per-image collapse takes max-across-frames for each extractor image, producing N values; peak+mean aggregates those. Worked on the user's `[0.1, 0.1, 0.1, 1.0]` toy example (scored 0.66) but didn't reflect the user's actual intent — they want the full M×N pair distribution evaluated, not the dimension-collapsed N-vector.
+- **Soft-OR** (`1 - prod(1 - s)`): saturates at 1.0 the moment any single sim is 1.0. One shared/coincident image (hash collision on real-but-unrelated content) pinned the aggregate to 1.0 regardless of the rest of the record. Variance and degeneracy filters help but can't catch real-content collisions.
+- **Max alone**: same failure mode as soft-OR — single outlier dominates.
+- **Mean over flat M×N**: ignores the strong-match signal. A real match's strong pairs get diluted by 30+ weak frame×unrelated-image pairs.
+- **Peak + mean over flat M×N**: the dilution from M×N pairs makes mean tiny, so the score collapses to roughly `(peak + small)/2 ≈ peak/2`. Single-outlier false positives still win — verified arithmetically on the field-observed case.
+
+Top-K mean dodges all these:
+- Outlier 1.0 in a sea of low sims → top-K still includes the K-1 weak runners-up → mean drops it.
+- Mean over the full flat set → would average 35+ weak pairs in; top-K avoids that.
+- Max → ignores corroborating matches; top-K rewards them.
+
+### K = number of extractor images, not min(M,N) or max(M,N)
+
+The semantics are "for each extractor image we'd hope to see one strong sprite-frame match." That's N expected strong pairs. K = N is the natural fit. Note that top-N over an M×N grid can pick multiple strong pairs from the same extractor image (when adjacent sprite frames are visually similar) — this is fine; redundant matches are still corroborating evidence, just less than N truly independent matches.
+
+When the record has only N=1 extractor image, K=1 and the aggregate degenerates to `max(sims)` — for a 1-image record that's the only sensible answer, and the threshold guards against accepting a single weak match as definitive.
+
+### Threshold gates the aggregate, not individual sims
+
+In scrape mode the threshold is now applied to the top-K mean: `aggregate >= threshold → fires`. This is a deliberate change from the prior "any sim ≥ threshold" gate. With the new gate:
+- A single 1.0 sim no longer bypasses the threshold automatically.
+- A consistent set of moderate matches (e.g. all sims ≈ 0.65 with threshold 0.6) DOES fire, because the aggregate carries evidence that one sim alone wouldn't.
+
+**Don't**: switch back to per-extractor-image collapse — the user's intent is full M×N evaluation. **Don't**: switch back to soft-OR — saturation re-introduces the false-positive class. **Don't**: gate the threshold on individual sims — that re-introduces the one-outlier vector. **Don't**: change K without thinking through whether the new value preserves "one expected strong match per extractor image" semantics.
 
 ### Input filtering — must happen *before* aggregation
 

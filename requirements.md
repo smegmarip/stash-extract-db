@@ -255,15 +255,13 @@ def scrape(scene, candidates, image_mode, threshold):
         if hits:
             return min(hits, key=lambda c: c.result_index)
 
-    # Tier 3: Image — per-extractor-image best-match sims, then
-    # above-threshold soft-OR aggregation. A candidate fires when at least
-    # one extractor image clears `threshold`. Among firing candidates, the
-    # rank score rewards multiple strong matches over single borderline
-    # matches (see §7 + CLAUDE.md §13).
+    # Tier 3: Image — full M×N pair similarity, top-K mean aggregation
+    # with K = N (number of extractor images). Threshold gates the
+    # aggregate, not individual pair sims (CLAUDE.md §13).
     matches = []
     for c in candidates:
-        sims = per_extractor_image_sims(scene, c, image_mode)
-        score = aggregate_scrape(sims, threshold)   # = soft_or([s for s in sims if s >= threshold])
+        sims, n_images = all_pair_sims(scene, c, image_mode)
+        score = aggregate_scrape(sims, n_images, threshold)   # = top_k_mean(sims, n_images) if >= threshold else 0
         if score > 0:
             matches.append((c, score))
     if matches:
@@ -294,11 +292,11 @@ Where:
 
 ```python
 def image_contribution(scene, c, image_mode):
-    sims = per_extractor_image_sims(scene, c, image_mode)
-    return aggregate_search(sims)                         # = soft_or(sims)
+    sims, n_images = all_pair_sims(scene, c, image_mode)
+    return aggregate_search(sims, n_images)               # = top_k_mean(sims, k=n_images)
 ```
 
-Image **always** contributes in search — the threshold no longer gates the contribution. The aggregation is distribution-sensitive (soft-OR): a record with `[0.1, 0.1, 0.1, 1.0]` outranks one with `[0.13, 0.13, 0.13, 0.13]` because soft-OR returns 1.0 vs 0.43 (CLAUDE.md §13).
+Image **always** contributes in search — the threshold no longer gates the contribution. The aggregation is the top-K mean over the flat M×N pair set (K = number of extractor images): single outliers don't dominate, multiple strong matches do (CLAUDE.md §13 + §7.2).
 
 ### 6.3 Filename score (multi-channel)
 
@@ -434,33 +432,48 @@ Lift these modules into `bridge/app/imgmatch/`:
 - `image_comparison.py` — `detect_letterbox`, `normalize_image`, `compute_hash`, `hash_distance_to_similarity`, `HASH_FUNCS`.
 - `sprite_processor.py` — `parse_vtt`, `fetch_vtt`, `extract_sprite_frames`, `sample_frames`.
 
-### 7.2 Comparable shapes + distribution-sensitive aggregation
+### 7.2 Flat M×N pair evaluation + top-K mean aggregation
 
-The engine first computes **per-extractor-image best-match sims** — for each extractor image (`cover_image` ∪ `images[]`, deduped), the best similarity against the configured Stash-side hash set:
+The engine computes **every Stash-side × extractor-side pair similarity** as a flat list. No per-extractor-image collapse — the full M×N pair distribution is what the aggregator sees.
 
-| `image_mode` | Stash-side set | Per-extractor-image score |
+| `image_mode` | Stash-side set | Pair count |
 |---|---|---|
-| `cover`  | `{paths.screenshot}` (size 1)              | `sim(stash_cover, e_i)` |
-| `sprite` | `{frame_1 … frame_M}` (M sampled frames)   | `max_j sim(frame_j, e_i)` |
-| `both`   | `{paths.screenshot} ∪ {frame_1 … frame_M}` | `max over union` |
+| `cover`  | `{paths.screenshot}` (size 1)              | 1 × N |
+| `sprite` | `{frame_1 … frame_M}` (M sampled frames)   | M × N |
+| `both`   | `{paths.screenshot} ∪ {frame_1 … frame_M}` | (M+1) × N |
 
-This produces an array `sims` of length N (one entry per extractor image). The array is then aggregated:
+Where N = number of usable extractor images (post-filtering). Both sides are filtered for degenerate / 404 / low-variance hashes (§7.5).
+
+The aggregation is **top-K mean** with K = N:
 
 ```python
-def soft_or(sims):
-    """1 - prod(1 - s) — bounded [0,1], saturates at 1.0 when any sim is 1.0."""
-    p = 1.0
-    for s in sims:
-        p *= max(0.0, 1.0 - min(1.0, s))
-    return 1.0 - p
+def top_k_mean(sims, k):
+    """Mean of the top-K values in `sims`, sorted descending."""
+    if not sims:
+        return 0.0
+    k = max(1, min(k, len(sims)))
+    return sum(sorted(sims, reverse=True)[:k]) / k
 
-def aggregate_search(sims):     return soft_or(sims)
-def aggregate_scrape(sims, t):  return soft_or([s for s in sims if s >= t])
+def aggregate_search(sims, n_images):
+    """No threshold gate — top-K mean directly."""
+    return top_k_mean(sims, k=n_images)
+
+def aggregate_scrape(sims, n_images, threshold):
+    """Threshold gates the aggregate (not individual pair sims).
+    Fires only when the top-K mean clears `threshold`."""
+    score = top_k_mean(sims, k=n_images)
+    return score if score >= threshold else 0.0
 ```
 
-**Why per-extractor-image, not flat M×N**: in sprite mode, every (frame, image) pair is evidence, but flattening would let many weak coincidental matches accumulate spurious signal. Collapsing to one score per extractor image first ensures the distribution reflects the record's image set, not the Stash sprite resolution. CLAUDE.md §13.
+**Why K = N (extractor images)**: the natural success criterion is "for each extractor image, at least one strong sprite-frame match." That's N expected strong pairs in a real match. Top-N picks the N best pairs as the record's strongest evidence and averages them.
 
-**Why soft-OR, not max or mean**: it captures both peak strength AND number of matches in a single bounded number. A record with 1×1.0 + 3×0.1 saturates at 1.0; a record with 4×0.13 stays at 0.43. Mean would tie them at 0.325 vs 0.13; max would lose the contribution from the weaker matches when they're meaningful.
+**Why top-K mean, not max / soft-OR / peak+mean / arithmetic mean**:
+- *Max* and *soft-OR* let a single outlier 1.0 dominate (real-content hash collisions or shared decorative assets) → one-outlier false positives.
+- *Arithmetic mean over flat M×N* dilutes strong matches with the 30+ weak frame×unrelated-image pairs.
+- *Peak+mean over flat M×N* devolves to ~peak/2 because the M×N denominator shrinks the mean term — single outliers still win.
+- *Top-K mean* takes the upper tail without the outlier-dominance problem: a single 1.0 in a sea of low sims still pulls in K-1 weak runners-up to the mean → real matches with K consistent strong pairs win.
+
+**Threshold gates the aggregate**: in scrape mode the threshold is applied to the top-K mean (`agg >= threshold → fires`). One sim of 1.0 surrounded by weak ones won't push the aggregate over a moderate threshold; a consistent set of moderate matches DOES fire. CLAUDE.md §13.
 
 ### 7.3 Asset fetching
 
