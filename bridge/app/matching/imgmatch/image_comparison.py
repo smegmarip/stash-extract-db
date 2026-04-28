@@ -66,9 +66,23 @@ def hash_distance_to_similarity(distance: int, hash_size: int = 16) -> float:
     return max(0.0, 1.0 - (distance / max_distance))
 
 
+# Pixel-variance threshold for refusing to hash near-uniform images.
+# Grayscale 0-255: real photos typically have variance > 1000; flat/blank
+# images have variance < 30. Set at 30 (generous) so we err on the side of
+# producing a hash and let the sim-time degeneracy check catch the rest.
+LOW_VARIANCE_THRESHOLD = 30.0
+
+
 def hash_image_bytes(data: bytes, algorithm: str = "phash", hash_size: int = 16):
+    """Returns an imagehash, or None if the source is too low-variance to
+    produce a reliable hash. Near-uniform images (all-black sprite frames
+    at fade-in/out, blank placeholder thumbs, generic icons) yield
+    degenerate pHashes that match each other at sim=1.0 — catastrophic
+    false positives. We refuse to hash them. Callers must handle None."""
     img = Image.open(io.BytesIO(data))
     normalized = normalize_image(img)
+    if np.asarray(normalized).var() < LOW_VARIANCE_THRESHOLD:
+        return None
     return compute_hash(normalized, algorithm, hash_size)
 
 

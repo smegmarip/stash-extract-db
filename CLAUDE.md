@@ -184,6 +184,18 @@ For sprite mode (`M` Stash sprite frames × `N` extractor images), we collapse t
 
 **Don't**: replace soft-OR with arithmetic or geometric mean — both lose the "one strong match dominates" property. **Don't**: aggregate over Stash-side dimensions (frames) — only over extractor images. **Don't**: skip the per-image step and pre-flatten — the distribution would dissolve into a single max.
 
+### Input filtering — must happen *before* aggregation
+
+Soft-OR's "one strong match dominates" property cuts both ways: a single bad sim of 1.0 will saturate the aggregate to 1.0 regardless of every other signal. So images that can produce spurious 1.0 sims must be filtered out before they ever reach `_sim`. Three filters apply, in order:
+
+1. **404 / fetch failure** (`extractor/client.fetch_asset` returns `None`). Not every record's `images[]` was successfully downloaded by the extractor. Callers must drop refs whose hash is `None` from the per-image sims list — *not* append a 0.0 entry.
+2. **Low pixel variance at hash time** (`imgmatch/image_comparison.hash_image_bytes` returns `None` if `np.var(normalized) < LOW_VARIANCE_THRESHOLD`). Catches all-black sprite frames (fade-in/out) and blank/placeholder extractor images at the source — they never produce a hash, never get cached, never participate.
+3. **Degenerate-hash check at sim time** (`_is_degenerate_hash`). Belt-and-braces: a pHash with bit-density outside `[10%, 90%]` came from a near-uniform source. Catches anything that snuck through (e.g. a hash cached before filter #2 was added). `_sim` returns 0 on either operand being degenerate.
+
+**Why this ordering**: filter #1 saves bandwidth (don't fetch what's known-missing), filter #2 saves cache and compute (don't hash uniform pixels), filter #3 is the safety net. All three result in the same downstream behavior: the ref is *omitted* from the per-image sims list. The list length should equal the number of usable comparisons, not the number of attempted ones.
+
+**Don't**: append `0.0` entries for failed/uniform images — they're noise in debug output and tempt future maintainers to "fix" them. **Don't**: cache the string `"None"` as a hash — old code path; check that any new caller of `_hash_or_compute` handles `h is None` correctly (skip the cache write, return None to caller).
+
 ---
 
 ## 14. Where to look first when something breaks

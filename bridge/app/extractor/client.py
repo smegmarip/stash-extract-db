@@ -80,12 +80,19 @@ def resolve_asset_url(job_id: str, ref: str) -> str:
 
 
 async def fetch_asset(job_id: str, ref: str) -> Optional[bytes]:
+    """Fetch a single extractor asset. Returns None on missing/broken
+    assets (404 in particular is expected — not every record's image[]
+    set was successfully downloaded by the extractor). Callers must skip
+    these refs from per-image matching (see matching/image_match.py)."""
     url = resolve_asset_url(job_id, ref) if not ref.startswith("http") else ref
     if not url:
         return None
     async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         try:
             r = await client.get(url)
+            if r.status_code == 404:
+                logger.debug("extractor asset 404: %s", url)
+                return None
             r.raise_for_status()
             return r.content
         except Exception as e:

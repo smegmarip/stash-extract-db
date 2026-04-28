@@ -49,7 +49,16 @@ async def _hash_or_compute(
     algorithm: str, hash_size: int,
     fetcher,
 ) -> Optional[Any]:
-    """fetcher() -> bytes (awaitable). Returns imagehash or None."""
+    """fetcher() -> bytes (awaitable). Returns imagehash or None.
+
+    None means "no usable hash" for any of the upstream reasons:
+      - empty fingerprint (no cache key)
+      - fetch failed (404, network error, missing asset)
+      - image too low-variance (near-uniform; hash_image_bytes returns None)
+      - hashing raised
+    Callers must skip None-hash images from the per-image sims list rather
+    than treating them as 0.0 comparisons (CLAUDE.md §13).
+    """
     if not fingerprint:
         return None
     cached = await cdb.get_image_hash(source, ref_id, fingerprint, algorithm, hash_size)
@@ -62,6 +71,13 @@ async def _hash_or_compute(
         h = hash_image_bytes(data, algorithm, hash_size)
     except Exception as e:
         logger.warning("hash failed source=%s ref=%s :: %s", source, ref_id, e)
+        return None
+    if h is None:
+        # Low-variance (near-uniform) image — can't produce a reliable hash.
+        # Don't cache; the next request will retry but the same source bytes
+        # will still fail, so we burn one fetch per low-variance image per
+        # cache lifetime. Acceptable — these are rare.
+        logger.debug("skipping low-variance image source=%s ref=%s", source, ref_id)
         return None
     await cdb.set_image_hash(source, ref_id, fingerprint, algorithm, hash_size, str(h))
     return h
@@ -130,8 +146,36 @@ async def extractor_image_hash(job_id: str, ref: str, algorithm: str, hash_size:
     )
 
 
+def _is_degenerate_hash(phash) -> bool:
+    """Bit-density check on a pHash hex string. A real image's pHash bits
+    cluster around 50% population (because pHash thresholds against the DCT
+    median). All-black/all-white/near-uniform images produce hashes with
+    bit density near 0% or 100% — those collisions are spurious.
+
+    The cutoff is generous (10%/90%) so the variance check at hash time
+    stays the primary defense; this is belt-and-braces for any degenerate
+    hash that snuck through (e.g. cached from before the variance filter
+    was added)."""
+    if phash is None:
+        return True
+    s = str(phash)
+    if not s:
+        return True
+    try:
+        ones = bin(int(s, 16))[2:].count("1")
+    except ValueError:
+        return True
+    total = len(s) * 4
+    if total == 0:
+        return True
+    frac = ones / total
+    return frac < 0.10 or frac > 0.90
+
+
 def _sim(h_a, h_b, hash_size: int) -> float:
     if h_a is None or h_b is None:
+        return 0.0
+    if _is_degenerate_hash(h_a) or _is_degenerate_hash(h_b):
         return 0.0
     try:
         d = h_a - h_b
@@ -156,14 +200,25 @@ async def per_extractor_image_sims(
       - sprite → Stash-side set is {sprite frame 1..M}           (M)
       - both   → Stash-side set is {screenshot, frame 1..M}      (M+1)
 
-    Result length == number of distinct extractor image refs. Each entry
-    is the max similarity against the Stash-side set for that extractor
-    image. This per-image array is the input to the distribution-sensitive
-    aggregation (see aggregate_search / aggregate_scrape).
+    Result length == number of *usable* extractor image refs — we drop
+    refs whose hash is None (404, fetch error, low-variance image — see
+    `_hash_or_compute`) and refs whose hash is degenerate (all-black /
+    all-white / near-uniform — see `_is_degenerate_hash`). Stash-side
+    degenerate frames are filtered the same way. The goal is "signal
+    only": every entry in the returned list is a real comparison between
+    two images that carry visual information.
+
+    Each entry is the max similarity against the Stash-side set for that
+    extractor image. This per-image array is the input to the
+    distribution-sensitive aggregation (see aggregate_search /
+    aggregate_scrape).
 
     Per CLAUDE.md §13: rewards records with multiple strong matches over
     records with many mediocre matches; soft-OR aggregation lifts a single
-    high-similarity hit to dominance regardless of weak siblings.
+    high-similarity hit to dominance regardless of weak siblings — which
+    is exactly why we have to reject degenerate sources here. Two
+    all-black images would otherwise match at sim=1.0 and saturate
+    soft-OR, producing an agg=1.0 false-positive scrape result.
     """
     refs: list[str] = list(record.get("images") or [])
     cover_ref = record.get("cover_image")
@@ -172,21 +227,28 @@ async def per_extractor_image_sims(
     if not refs:
         return []
 
-    # Build Stash-side hash set once per scene+mode (re-used across all candidates upstream)
+    # Build Stash-side hash set once per scene+mode. Drop None and
+    # degenerate hashes — these contribute no usable signal and can
+    # collide spuriously.
     stash_hashes: list = []
     if image_mode in ("cover", "both"):
         c = await stash_cover_hash(scene, algorithm, hash_size)
-        if c is not None:
+        if c is not None and not _is_degenerate_hash(c):
             stash_hashes.append(c)
     if image_mode in ("sprite", "both"):
-        sprite_hashes = await stash_sprite_hashes(scene, algorithm, hash_size, sprite_sample_size)
-        stash_hashes.extend(sprite_hashes)
+        for sh in await stash_sprite_hashes(scene, algorithm, hash_size, sprite_sample_size):
+            if sh is not None and not _is_degenerate_hash(sh):
+                stash_hashes.append(sh)
+    if not stash_hashes:
+        return []
 
     sims: list[float] = []
     for ref in refs:
         eh = await extractor_image_hash(job_id, ref, algorithm, hash_size)
-        if eh is None or not stash_hashes:
-            sims.append(0.0)
+        if eh is None or _is_degenerate_hash(eh):
+            # 404, low-variance, or degenerate — drop from sims entirely.
+            # Soft-OR is unchanged by zeros, but listing them in debug is
+            # noise; an absent entry says "no comparison happened here".
             continue
         best = 0.0
         for sh in stash_hashes:
