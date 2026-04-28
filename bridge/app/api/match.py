@@ -11,6 +11,7 @@ All routes:
 import asyncio
 import base64
 import logging
+import re
 from typing import Any, Optional
 
 from fastapi import APIRouter, HTTPException, Query
@@ -112,6 +113,26 @@ async def _build_candidate_pool(jobs: list[dict[str, Any]]) -> list[dict[str, An
 
 # ---------- transform extractor record → Stash output -----------------
 
+# Web-scraped details often contain runs of whitespace, blank lines, and
+# stray indentation pulled from the source HTML. Stash treats Details as
+# free-form text but renders consecutive whitespace verbatim, so noise
+# comes through visibly. Collapse to "at most one consecutive newline,
+# at most one consecutive horizontal-whitespace character" and strip
+# leading/trailing whitespace. Single line breaks are preserved (so
+# paragraph structure survives); single spaces are preserved.
+_RUN_NEWLINE = re.compile(r"(?:[ \t\f\v]*\r?\n[ \t\f\v]*)+")
+_RUN_HSPACE = re.compile(r"[ \t\f\v]+")
+
+
+def _sanitize_text(s: Optional[str]) -> Optional[str]:
+    if not s:
+        return None
+    s = _RUN_NEWLINE.sub("\n", s)
+    s = _RUN_HSPACE.sub(" ", s)
+    s = s.strip()
+    return s or None
+
+
 async def _record_to_scrape_result(
     candidate: dict[str, Any],
     studio_name: Optional[str],
@@ -147,7 +168,7 @@ async def _record_to_scrape_result(
 
     return ScrapeResult(
         Title=rec.get("title") or None,
-        Details=rec.get("details") or None,
+        Details=_sanitize_text(rec.get("details")),
         Date=rec.get("date") or None,
         URL=rec.get("url") or None,
         Code=code,
