@@ -7,7 +7,7 @@ import logging
 from typing import Any, Optional
 
 from .text import studio_and_code_fires, exact_title_fires
-from .image_match import best_image_similarity
+from .image_match import per_extractor_image_sims, aggregate_scrape
 
 logger = logging.getLogger(__name__)
 
@@ -38,20 +38,25 @@ async def scrape(
         logger.info("scrape match via Exact Title: job=%s idx=%d", best["job_id"], best["result_index"])
         return best
 
-    # Tier 3: Image >= threshold (highest similarity wins; index breaks ties)
+    # Tier 3: Image — fires when at least one extractor image clears the
+    # threshold for this candidate. Among firing candidates, the rank score
+    # is a distribution-sensitive aggregation (soft-OR) over the above-
+    # threshold per-image sims — favors records with multiple strong matches
+    # over records with one or two borderline matches (CLAUDE.md §13).
     matches: list[tuple[dict[str, Any], float]] = []
     for c in candidates:
-        sim = await best_image_similarity(
+        sims = await per_extractor_image_sims(
             scene, c["job_id"], c["data"], image_mode,
             algorithm, hash_size, sprite_sample_size,
         )
-        if sim >= threshold:
-            matches.append((c, sim))
+        score = aggregate_scrape(sims, threshold)
+        if score > 0:
+            matches.append((c, score))
     if matches:
         matches.sort(key=lambda m: (-m[1], m[0]["job_id"], m[0]["result_index"]))
-        winner, sim = matches[0]
-        logger.info("scrape match via Image: job=%s idx=%d sim=%.3f",
-                    winner["job_id"], winner["result_index"], sim)
+        winner, score = matches[0]
+        logger.info("scrape match via Image (%s): job=%s idx=%d agg=%.3f",
+                    image_mode, winner["job_id"], winner["result_index"], score)
         return winner
 
     return None

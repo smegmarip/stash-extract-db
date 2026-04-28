@@ -39,22 +39,20 @@ All three signals are equivalently definitive. Reordering does not change *which
 
 ---
 
-## 4. Image is binary in scrape, weighted in search
+## 4. Image: threshold-gated in scrape, unconditional in search; distribution-sensitive in both
 
-> **The threshold gates inclusion in scrape. The threshold gates the multiplier in search.**
+> **Scrape uses above-threshold soft-OR. Search uses unconditional soft-OR. The threshold applies only to scrape.**
 
-In **scrape**: image similarity ≥ threshold → fires; below → doesn't fire. Threshold is a hard gate.
+For each candidate, the engine first computes **per-extractor-image similarities** — for each extractor image (`cover_image` + `images[]`), the best similarity against the configured Stash-side hash set (cover, sprite frames, or union per `image_mode`). This produces an array of N sims, one per extractor image. See §13 for the why.
 
-In **search**: image *always* contributes to the score:
+Then aggregation differs by mode:
 
-```
-contribution = raw_sim                if raw_sim >= threshold
-             = 0.5 * raw_sim          otherwise
-```
+- **Scrape** — `aggregate_scrape(sims, threshold)`: filter to sims ≥ threshold, then soft-OR. Returns 0 if no sim clears the threshold (the candidate doesn't fire the image tier). Among firing candidates, the aggregate is the rank score; tiebreak by `result_index`.
+- **Search** — `aggregate_search(sims)`: unconditional soft-OR over all per-image sims. The threshold is **not** consulted in search.
 
-The threshold determines whether the contribution is full or half. A 0.69 cover similarity (just below a 0.7 threshold) still contributes `0.345` to the search score. This is intentional — search is for human curation; weak signal is still signal.
+This replaces the prior `raw_sim if ≥ threshold else 0.5*raw_sim` rule. The new rule is simpler and stronger: in search every match contributes proportional to its strength and the number of matches; in scrape only above-threshold matches count, but multiple of them outrank a single borderline one.
 
-**Don't**: filter search candidates by `image_sim >= threshold`. **Don't**: let below-threshold image contribute its full raw value.
+**Don't**: filter search candidates by `image_sim >= threshold`. **Don't**: re-introduce the 0.5-multiplier rule. **Don't**: collapse the per-image sims to a single max before aggregation — the distribution carries the signal (§13).
 
 ---
 
@@ -168,7 +166,27 @@ The full breakdown is observable via `?debug=1` on `/match/*` endpoints (search 
 
 ---
 
-## 13. Where to look first when something breaks
+## 13. Image scores are aggregated distribution-sensitively (soft-OR), never collapsed to max
+
+> **Per-extractor-image best-match sims are computed first; then aggregated. The aggregation rewards both peak strength and number of matches.**
+
+Exact image matches between independently-encoded scenes are rare. A scene that genuinely matches an extractor record will typically produce multiple medium-to-strong similarities across that record's image set, while an unrelated scene will produce a flat distribution of low scores even with many images.
+
+Concrete: a record with `[0.1, 0.1, 0.1, 1.0]` outranks one with `[0.13, 0.13, 0.13, 0.13]`, despite the second having a higher mean and the same `max(sim) - mean(sim)` spread. Distribution-sensitive aggregation captures this; `max()` alone would tie them at 1.0 vs 0.13 (still right here) but loses information when no perfect match exists.
+
+The aggregation is **soft-OR** (`1 - prod(1 - s for s in sims)`):
+- Bounded `[0, 1]` so it composes cleanly with the search score (`+= contribution`, capped at 1.0).
+- Saturates at 1.0 when any sim is 1.0 — a perfect match dominates regardless of weak siblings.
+- Multiple weak matches accumulate but never overwhelm a single strong match.
+- Symmetric in input order; deterministic.
+
+For sprite mode (`M` Stash sprite frames × `N` extractor images), we collapse the M×N matrix **per extractor image** — for each extractor image, the best matching Stash sprite frame is its score. Aggregation then runs over those `N` per-image scores, mirroring cover mode's structure. We do **not** flatten all M×N pairs into one bag — that would let many weak frame-image pairs accumulate spurious signal.
+
+**Don't**: replace soft-OR with arithmetic or geometric mean — both lose the "one strong match dominates" property. **Don't**: aggregate over Stash-side dimensions (frames) — only over extractor images. **Don't**: skip the per-image step and pre-flatten — the distribution would dissolve into a single max.
+
+---
+
+## 14. Where to look first when something breaks
 
 | Symptom | First place to check |
 |---|---|

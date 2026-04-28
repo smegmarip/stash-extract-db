@@ -255,22 +255,25 @@ def scrape(scene, candidates, image_mode, threshold):
         if hits:
             return min(hits, key=lambda c: c.result_index)
 
-    # Tier 3: Image match (per image_mode, max across image set)
-    hits = []
+    # Tier 3: Image — per-extractor-image best-match sims, then
+    # above-threshold soft-OR aggregation. A candidate fires when at least
+    # one extractor image clears `threshold`. Among firing candidates, the
+    # rank score rewards multiple strong matches over single borderline
+    # matches (see §7 + CLAUDE.md §13).
+    matches = []
     for c in candidates:
-        sim = max(
-            cover_sim(scene, c)  if image_mode in ("cover","both")  else 0,
-            sprite_sim(scene, c) if image_mode in ("sprite","both") else 0,
-        )
-        if sim >= threshold:
-            hits.append((c, sim))
-    if hits:
-        return min(hits, key=lambda h: h[0].result_index)[0]
+        sims = per_extractor_image_sims(scene, c, image_mode)
+        score = aggregate_scrape(sims, threshold)   # = soft_or([s for s in sims if s >= threshold])
+        if score > 0:
+            matches.append((c, score))
+    if matches:
+        matches.sort(key=lambda m: (-m[1], m[0].job_id, m[0].result_index))
+        return matches[0][0]
 
     return None    # → empty {} response
 ```
 
-Tiebreak across all tiers: lowest `result_index` (the index from `GET /api/extraction/{job_id}/results?sort_dir=asc`).
+Tiebreak across all tiers: highest aggregate score, then lowest `result_index` (the index from `GET /api/extraction/{job_id}/results?sort_dir=asc`).
 
 ### 6.2 Search mode — composite weighted score
 
@@ -280,9 +283,8 @@ Every candidate gets a score:
 score = (
     (1.0 if studio_and_code(scene, c) else 0.0)
   + (1.0 if scene.title and scene.title == c.title else 0.0)
-  + image_contribution(scene, c, image_mode, threshold)
-  + 0.2 * (rapidfuzz.WRatio(norm(scene.basename),
-                            norm(extract_basename(c.url))) / 100)
+  + image_contribution(scene, c, image_mode)              # see §7
+  + 0.2 * filename_score(scene, c)                        # multi-channel; §6.3
   + 0.3 * (0.5 * performer_score(scene, c) + 0.5 * date_score(scene, c))
 )
 score = min(score, 1.0)     # cap at 1.0
@@ -291,15 +293,12 @@ score = min(score, 1.0)     # cap at 1.0
 Where:
 
 ```python
-def image_contribution(scene, c, image_mode, threshold):
-    raw = max(
-        cover_sim(scene, c)  if image_mode in ("cover","both")  else 0,
-        sprite_sim(scene, c) if image_mode in ("sprite","both") else 0,
-    )
-    return raw if raw >= threshold else 0.5 * raw
+def image_contribution(scene, c, image_mode):
+    sims = per_extractor_image_sims(scene, c, image_mode)
+    return aggregate_search(sims)                         # = soft_or(sims)
 ```
 
-Image is *always* weighted in search — threshold gates the multiplier (raw vs. half-raw), not inclusion.
+Image **always** contributes in search — the threshold no longer gates the contribution. The aggregation is distribution-sensitive (soft-OR): a record with `[0.1, 0.1, 0.1, 1.0]` outranks one with `[0.13, 0.13, 0.13, 0.13]` because soft-OR returns 1.0 vs 0.43 (CLAUDE.md §13).
 
 ### 6.3 Filename score (multi-channel)
 
@@ -435,15 +434,33 @@ Lift these modules into `bridge/app/imgmatch/`:
 - `image_comparison.py` — `detect_letterbox`, `normalize_image`, `compute_hash`, `hash_distance_to_similarity`, `HASH_FUNCS`.
 - `sprite_processor.py` — `parse_vtt`, `fetch_vtt`, `extract_sprite_frames`, `sample_frames`.
 
-### 7.2 Comparable shapes
+### 7.2 Comparable shapes + distribution-sensitive aggregation
 
-| `image_mode` | Stash side | Extractor side | Comparison |
-|---|---|---|---|
-| `cover` | `paths.screenshot` (1 image) | `data.images[]` (N images) | 1:N → `max` similarity |
-| `sprite` | sprite frames (M sampled) | `data.images[]` (N images) | M:N → `max` similarity |
-| `both` | union of above | union of above | run both, take `max` |
+The engine first computes **per-extractor-image best-match sims** — for each extractor image (`cover_image` ∪ `images[]`, deduped), the best similarity against the configured Stash-side hash set:
 
-The strongest signal wins per pair — no aggregation, no averaging.
+| `image_mode` | Stash-side set | Per-extractor-image score |
+|---|---|---|
+| `cover`  | `{paths.screenshot}` (size 1)              | `sim(stash_cover, e_i)` |
+| `sprite` | `{frame_1 … frame_M}` (M sampled frames)   | `max_j sim(frame_j, e_i)` |
+| `both`   | `{paths.screenshot} ∪ {frame_1 … frame_M}` | `max over union` |
+
+This produces an array `sims` of length N (one entry per extractor image). The array is then aggregated:
+
+```python
+def soft_or(sims):
+    """1 - prod(1 - s) — bounded [0,1], saturates at 1.0 when any sim is 1.0."""
+    p = 1.0
+    for s in sims:
+        p *= max(0.0, 1.0 - min(1.0, s))
+    return 1.0 - p
+
+def aggregate_search(sims):     return soft_or(sims)
+def aggregate_scrape(sims, t):  return soft_or([s for s in sims if s >= t])
+```
+
+**Why per-extractor-image, not flat M×N**: in sprite mode, every (frame, image) pair is evidence, but flattening would let many weak coincidental matches accumulate spurious signal. Collapsing to one score per extractor image first ensures the distribution reflects the record's image set, not the Stash sprite resolution. CLAUDE.md §13.
+
+**Why soft-OR, not max or mean**: it captures both peak strength AND number of matches in a single bounded number. A record with 1×1.0 + 3×0.1 saturates at 1.0; a record with 4×0.13 stays at 0.43. Mean would tie them at 0.325 vs 0.13; max would lose the contribution from the weaker matches when they're meaningful.
 
 ### 7.3 Asset fetching
 

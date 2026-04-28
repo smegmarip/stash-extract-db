@@ -140,6 +140,102 @@ def _sim(h_a, h_b, hash_size: int) -> float:
         return 0.0
 
 
+async def per_extractor_image_sims(
+    scene: dict[str, Any],
+    job_id: str,
+    record: dict[str, Any],
+    image_mode: str,
+    algorithm: str,
+    hash_size: int,
+    sprite_sample_size: int,
+) -> list[float]:
+    """For each extractor image (cover_image + images[], deduped), return
+    the best similarity against the configured Stash-side image set:
+
+      - cover  → Stash-side set is {screenshot}                  (1)
+      - sprite → Stash-side set is {sprite frame 1..M}           (M)
+      - both   → Stash-side set is {screenshot, frame 1..M}      (M+1)
+
+    Result length == number of distinct extractor image refs. Each entry
+    is the max similarity against the Stash-side set for that extractor
+    image. This per-image array is the input to the distribution-sensitive
+    aggregation (see aggregate_search / aggregate_scrape).
+
+    Per CLAUDE.md §13: rewards records with multiple strong matches over
+    records with many mediocre matches; soft-OR aggregation lifts a single
+    high-similarity hit to dominance regardless of weak siblings.
+    """
+    refs: list[str] = list(record.get("images") or [])
+    cover_ref = record.get("cover_image")
+    if cover_ref and cover_ref not in refs:
+        refs = [cover_ref] + refs
+    if not refs:
+        return []
+
+    # Build Stash-side hash set once per scene+mode (re-used across all candidates upstream)
+    stash_hashes: list = []
+    if image_mode in ("cover", "both"):
+        c = await stash_cover_hash(scene, algorithm, hash_size)
+        if c is not None:
+            stash_hashes.append(c)
+    if image_mode in ("sprite", "both"):
+        sprite_hashes = await stash_sprite_hashes(scene, algorithm, hash_size, sprite_sample_size)
+        stash_hashes.extend(sprite_hashes)
+
+    sims: list[float] = []
+    for ref in refs:
+        eh = await extractor_image_hash(job_id, ref, algorithm, hash_size)
+        if eh is None or not stash_hashes:
+            sims.append(0.0)
+            continue
+        best = 0.0
+        for sh in stash_hashes:
+            s = _sim(sh, eh, hash_size)
+            if s > best:
+                best = s
+        sims.append(best)
+    return sims
+
+
+def soft_or(sims: list[float]) -> float:
+    """Probabilistic OR — `1 - prod(1 - s)`.
+
+    Properties (per CLAUDE.md §13):
+      - Bounded [0, 1]; saturates at 1.0 when any sim hits 1.0.
+      - Distribution-sensitive: multiple weak matches accumulate, but a
+        single strong match dominates.
+      - Monotonic in every component sim.
+
+    Example: sims=[0.1,0.1,0.1,1.0] → 1.0;  sims=[0.13,0.13,0.13,0.13] → 0.427
+    """
+    if not sims:
+        return 0.0
+    p = 1.0
+    for s in sims:
+        if s < 0.0:
+            s = 0.0
+        elif s > 1.0:
+            s = 1.0
+        p *= (1.0 - s)
+    return 1.0 - p
+
+
+def aggregate_search(sims: list[float]) -> float:
+    """Search-mode aggregation — every per-image sim contributes (no threshold)."""
+    return soft_or(sims)
+
+
+def aggregate_scrape(sims: list[float], threshold: float) -> float:
+    """Scrape-mode aggregation — only above-threshold sims contribute. Returns
+    0.0 when no extractor image clears the threshold (the candidate doesn't
+    fire the image tier)."""
+    above = [s for s in sims if s >= threshold]
+    return soft_or(above)
+
+
+# Back-compat thin wrapper — returns the simple max similarity. Kept only for
+# any caller that still wants the old single-number signal; new code should
+# use per_extractor_image_sims + aggregate_*.
 async def best_image_similarity(
     scene: dict[str, Any],
     job_id: str,
@@ -149,38 +245,7 @@ async def best_image_similarity(
     hash_size: int,
     sprite_sample_size: int,
 ) -> float:
-    """Per requirements §7.2: cover is 1:N, sprite is M:N. Both = union, max."""
-    refs: list[str] = list(record.get("images") or [])
-    cover_ref = record.get("cover_image")
-    if cover_ref and cover_ref not in refs:
-        refs = [cover_ref] + refs
-    if not refs:
-        return 0.0
-
-    extractor_hashes = []
-    for ref in refs:
-        h = await extractor_image_hash(job_id, ref, algorithm, hash_size)
-        if h is not None:
-            extractor_hashes.append(h)
-    if not extractor_hashes:
-        return 0.0
-
-    best = 0.0
-
-    if image_mode in ("cover", "both"):
-        stash_cover = await stash_cover_hash(scene, algorithm, hash_size)
-        if stash_cover is not None:
-            for eh in extractor_hashes:
-                s = _sim(stash_cover, eh, hash_size)
-                if s > best:
-                    best = s
-
-    if image_mode in ("sprite", "both"):
-        sprite_hashes = await stash_sprite_hashes(scene, algorithm, hash_size, sprite_sample_size)
-        for sh in sprite_hashes:
-            for eh in extractor_hashes:
-                s = _sim(sh, eh, hash_size)
-                if s > best:
-                    best = s
-
-    return best
+    sims = await per_extractor_image_sims(
+        scene, job_id, record, image_mode, algorithm, hash_size, sprite_sample_size,
+    )
+    return max(sims) if sims else 0.0

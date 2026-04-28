@@ -3,10 +3,15 @@
 Score = clip(
     (1.0 if Studio+Code else 0)
   + (1.0 if Exact Title else 0)
-  + image_contribution(raw if >= threshold else 0.5*raw)
-  + 0.2 * filename_score          # multi-channel; see matching/filename.py
+  + aggregate_search(per_extractor_image_sims)   # distribution-sensitive (soft-OR)
+  + 0.2 * filename_score                          # multi-channel; matching/filename.py
   + 0.3 * (0.5 * performer_score + 0.5 * date_score)
 , 0, 1)
+
+Image contribution rewards both peak strength and number of matches: a
+record with 4 images scoring [0.1, 0.1, 0.1, 1.0] outranks one scoring
+[0.13, 0.13, 0.13, 0.13] (CLAUDE.md §13). The threshold no longer gates
+the search image contribution — it applies only to scrape (CLAUDE.md §4).
 """
 import logging
 from typing import Any, Optional
@@ -16,7 +21,7 @@ from .text import (
     date_score, performer_score,
 )
 from .filename import filename_score, filename_score_debug
-from .image_match import best_image_similarity
+from .image_match import per_extractor_image_sims, aggregate_search
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +63,11 @@ async def search(
         if et_fires:
             score += 1.0
 
-        sim = await best_image_similarity(
+        sims = await per_extractor_image_sims(
             scene, c["job_id"], rec, image_mode,
             algorithm, hash_size, sprite_sample_size,
         )
-        image_contrib = sim if sim >= threshold else 0.5 * sim
+        image_contrib = aggregate_search(sims)
         score += image_contrib
 
         if debug:
@@ -86,7 +91,12 @@ async def search(
             dbg = {
                 "studio_code": sc_fires,
                 "exact_title": et_fires,
-                "image_sim": round(sim, 4),
+                "image": {
+                    "mode": image_mode,
+                    "per_extractor_image_sims": [round(s, 4) for s in sims],
+                    "aggregation": "soft_or",
+                    "score": round(image_contrib, 4),
+                },
                 "image_contribution": round(image_contrib, 4),
                 "filename": fname_dbg,
                 "filename_contribution": round(0.2 * fname, 4),
