@@ -8,7 +8,7 @@ import io
 
 from PIL import Image
 
-from .image_comparison import normalize_image, compute_hash
+from .image_comparison import normalize_image, compute_hash, compute_quality
 
 
 def parse_vtt(vtt_text: str) -> list[dict]:
@@ -69,15 +69,22 @@ def hash_sprite_frames(
     algorithm: str = "phash",
     hash_size: int = 16,
 ) -> list:
-    """Returns list of imagehash objects for the sampled sprite frames."""
+    """Returns a list of `(imagehash, quality)` tuples — one per sampled frame.
+
+    Quality is per-frame q_i for grayscale-derived channels (pHash and tone
+    share the same formula); see MULTI_CHANNEL_SCORING.md §3.6. Phase 2:
+    stored alongside the hash but not yet consulted by scoring.
+    """
     sprite_img = Image.open(io.BytesIO(sprite_bytes))
     vtt_frames = parse_vtt(decode_vtt_text(vtt_text))
     if not vtt_frames:
         return []
     extracted = extract_sprite_frames(sprite_img, vtt_frames)
     sampled = sample_frames(extracted, sample_size)
-    out = []
+    out: list = []
     for frame in sampled:
         normalized = normalize_image(frame["image"])
-        out.append(compute_hash(normalized, algorithm, hash_size))
+        h = compute_hash(normalized, algorithm, hash_size)
+        q = compute_quality(normalized)
+        out.append((h, q))
     return out

@@ -6,8 +6,11 @@ Returns a single record (dict with job_id, result_index, data) or None.
 import logging
 from typing import Any, Optional
 
+from fastapi import HTTPException
+
+from ..settings import settings
 from .text import studio_and_code_fires, exact_title_fires
-from .image_match import all_pair_sims, aggregate_scrape
+from .image_match import all_pair_sims, aggregate_scrape, score_image_channel_a, score_image_composite
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +24,11 @@ async def scrape(
     algorithm: str,
     hash_size: int,
     sprite_sample_size: int,
+    image_gamma: Optional[float] = None,
+    image_count_k: Optional[float] = None,
+    image_channels: Optional[list[str]] = None,
+    image_min_contribution: Optional[float] = None,
+    image_bonus_per_extra: Optional[float] = None,
 ) -> Optional[dict[str, Any]]:
 
     # Tier 1: Studio + Code
@@ -38,18 +46,51 @@ async def scrape(
         logger.info("scrape match via Exact Title: job=%s idx=%d", best["job_id"], best["result_index"])
         return best
 
-    # Tier 3: Image — fires when at least one extractor image clears the
-    # threshold for this candidate. Among firing candidates, the rank score
-    # is a distribution-sensitive aggregation (soft-OR) over the above-
-    # threshold per-image sims — favors records with multiple strong matches
-    # over records with one or two borderline matches (CLAUDE.md §13).
+    # Tier 3: Image — fires when the image-channel composite clears the
+    # threshold for this candidate. The scoring path is selected by
+    # BRIDGE_NEW_SCORING_ENABLED:
+    #   - new (Phase 4+): within-channel formula per MULTI_CHANNEL_SCORING.md §3
+    #   - legacy: top-K-mean over flat M×N pair set (CLAUDE.md §13 prior)
+    use_new = settings.bridge_new_scoring_enabled
+    use_multi = bool(use_new and image_channels and len(image_channels) >= 1
+                     and set(image_channels) != {"phash"})
+    if use_new:
+        if image_gamma is None or image_count_k is None:
+            raise HTTPException(
+                status_code=400,
+                detail="image_gamma and image_count_k are required when BRIDGE_NEW_SCORING_ENABLED is true",
+            )
+    if use_multi and (image_min_contribution is None or image_bonus_per_extra is None):
+        raise HTTPException(
+            status_code=400,
+            detail="image_min_contribution and image_bonus_per_extra are required when image_channels has more than just 'phash'",
+        )
+
     matches: list[tuple[dict[str, Any], float]] = []
     for c in candidates:
-        sims, n_images = await all_pair_sims(
-            scene, c["job_id"], c["data"], image_mode,
-            algorithm, hash_size, sprite_sample_size,
-        )
-        score = aggregate_scrape(sims, n_images, threshold)
+        if use_multi:
+            res = await score_image_composite(
+                scene, c["job_id"], c["data"], c["result_index"],
+                image_mode, algorithm, hash_size, sprite_sample_size,
+                gamma=image_gamma, count_k=image_count_k,
+                channels=image_channels,
+                min_contribution=image_min_contribution,
+                bonus_per_extra=image_bonus_per_extra,
+            )
+            score = res["S"] if res["S"] >= threshold else 0.0
+        elif use_new:
+            res = await score_image_channel_a(
+                scene, c["job_id"], c["data"], image_mode,
+                algorithm, hash_size, sprite_sample_size,
+                gamma=image_gamma, count_k=image_count_k,
+            )
+            score = res["S"] if res["S"] >= threshold else 0.0
+        else:
+            sims, n_images = await all_pair_sims(
+                scene, c["job_id"], c["data"], image_mode,
+                algorithm, hash_size, sprite_sample_size,
+            )
+            score = aggregate_scrape(sims, n_images, threshold)
         if score > 0:
             matches.append((c, score))
     if matches:

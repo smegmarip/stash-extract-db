@@ -45,6 +45,14 @@ def _common_params() -> dict:
         "hash_algorithm": config.HASH_ALGORITHM,
         "hash_size": config.HASH_SIZE,
         "sprite_sample_size": config.SPRITE_SAMPLE_SIZE,
+        # Multi-channel scoring (read by the bridge only when its
+        # BRIDGE_NEW_SCORING_ENABLED is set; safely ignored otherwise).
+        "image_gamma": getattr(config, "IMAGE_GAMMA", 2.0),
+        "image_count_k": getattr(config, "IMAGE_COUNT_K", 2.0),
+        "image_uniqueness_alpha": getattr(config, "IMAGE_UNIQUENESS_ALPHA", 1.0),
+        "image_channels": getattr(config, "IMAGE_CHANNELS", ["phash", "color_hist", "tone"]),
+        "image_min_contribution": getattr(config, "IMAGE_MIN_CONTRIBUTION", 0.3),
+        "image_bonus_per_extra": getattr(config, "IMAGE_BONUS_PER_EXTRA", 0.1),
     }
 
 

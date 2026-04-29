@@ -35,3 +35,35 @@ SPRITE_SAMPLE_SIZE = 8
 
 # How long to wait for the bridge to respond, in seconds.
 REQUEST_TIMEOUT_S = 90
+
+# --- Multi-channel scoring (used when bridge has BRIDGE_NEW_SCORING_ENABLED=true)
+# See MULTI_CHANNEL_SCORING.md §3 for the formulas these tune.
+
+# Sharpening exponent: higher → stronger suppression of noise-floor
+# similarities. 2 is the calibrated default; raise to 3 for stricter
+# false-positive rejection if your corpus has many spurious near-matches.
+IMAGE_GAMMA = 2.0
+
+# Count-saturation k: lower → records with few images are penalized more
+# heavily relative to records with many. 2.0 is calibrated for typical
+# extractor records (≤5 images each).
+IMAGE_COUNT_K = 2.0
+
+# Uniqueness smoothing α: c_i = 1 / (1 + α * matches). Higher → reused
+# images (logos, title cards) get penalized more sharply.
+IMAGE_UNIQUENESS_ALPHA = 1.0
+
+# Channels to evaluate. Order doesn't matter for scoring (composition is
+# `max + bonus`). Drop a channel to disable it (e.g. ["phash"] to revert
+# to single-channel behavior with the new scoring formula).
+IMAGE_CHANNELS = ["phash", "color_hist", "tone"]
+
+# A channel "fires" if its S >= IMAGE_MIN_CONTRIBUTION; only firing
+# channels participate in cross-channel composition. Lower → more
+# channels qualify for the bonus; raise to gate out weak channels.
+IMAGE_MIN_CONTRIBUTION = 0.3
+
+# Cross-channel bonus per extra firing channel (composition is
+# `max(fired) + bonus * (n_fired - 1)`, capped at 1.0). Tune higher to
+# reward broad agreement, lower to make the strongest channel dominate.
+IMAGE_BONUS_PER_EXTRA = 0.1

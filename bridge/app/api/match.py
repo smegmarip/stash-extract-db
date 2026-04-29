@@ -25,8 +25,11 @@ from ..stash.alias_index import AliasResolver
 from ..extractor import client as ex_client
 from ..extractor.schema_match import is_scene_shaped
 from ..cache import invalidation as inv
+from ..cache import db as cdb
 from ..matching.scrape import scrape as scrape_match
 from ..matching.search import search as search_match
+from ..matching import worker as featurize_worker
+from ..settings import settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/match", tags=["Match"])
@@ -91,9 +94,47 @@ def _select_jobs_by_studio(jobs: list[dict[str, Any]], studio_name: Optional[str
     return matched, True
 
 
+async def _gate_features_ready(jobs: list[dict[str, Any]]) -> None:
+    """Per MULTI_CHANNEL_SCORING.md §4.2: any non-`ready` job in the
+    candidate set produces a 503 + Retry-After. Enqueue all non-ready jobs
+    so the bridge starts working immediately.
+
+    No-op when BRIDGE_LIFECYCLE_ENABLED=false (rollback path).
+    """
+    if not settings.bridge_lifecycle_enabled:
+        return
+    not_ready: list[tuple[str, Optional[float]]] = []
+    for j in jobs:
+        jid = j["id"]
+        state = await cdb.get_feature_state(jid)
+        if state is None or state["state"] != "ready":
+            not_ready.append((jid, (state or {}).get("progress")))
+            await featurize_worker.enqueue(jid)
+    if not not_ready:
+        return
+    # Retry-After heuristic: if any task has progress > 0, conservative
+    # estimate from the slowest one. Otherwise default to 10s for a queued
+    # task. Cap at 60s to bound client wait.
+    progresses = [p for _, p in not_ready if p is not None and p > 0]
+    if progresses:
+        slowest = min(progresses)
+        retry_after = max(2, min(60, int(round(10.0 * (1.0 - slowest) / slowest))))
+    else:
+        retry_after = 10
+    raise HTTPException(
+        status_code=503,
+        detail={
+            "error": "featurization_in_progress",
+            "jobs": [{"job_id": j, "progress": p} for j, p in not_ready],
+        },
+        headers={"Retry-After": str(retry_after)},
+    )
+
+
 async def _build_candidate_pool(jobs: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """For each job, ensure the result cache is fresh, then flatten into
     candidates of shape {job_id, result_index, page_url, data}."""
+    await _gate_features_ready(jobs)
     pool: list[dict[str, Any]] = []
     for j in jobs:
         try:
@@ -267,6 +308,11 @@ async def _match_with_scene(
             scene, pool, used_filter,
             req.image_mode, req.threshold,
             req.hash_algorithm, req.hash_size, req.sprite_sample_size,
+            image_gamma=req.image_gamma,
+            image_count_k=req.image_count_k,
+            image_channels=req.image_channels,
+            image_min_contribution=req.image_min_contribution,
+            image_bonus_per_extra=req.image_bonus_per_extra,
         )
         if not winner:
             return {}
@@ -279,6 +325,11 @@ async def _match_with_scene(
         req.image_mode, req.threshold,
         req.hash_algorithm, req.hash_size, req.sprite_sample_size,
         req.limit, alias_resolver, debug=debug,
+        image_gamma=req.image_gamma,
+        image_count_k=req.image_count_k,
+        image_channels=req.image_channels,
+        image_min_contribution=req.image_min_contribution,
+        image_bonus_per_extra=req.image_bonus_per_extra,
     )
     out: list[dict[str, Any]] = []
     for cand, score, dbg in ranked:

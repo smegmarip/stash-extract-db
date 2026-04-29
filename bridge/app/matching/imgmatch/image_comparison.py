@@ -73,17 +73,46 @@ def hash_distance_to_similarity(distance: int, hash_size: int = 16) -> float:
 LOW_VARIANCE_THRESHOLD = 30.0
 
 
+def compute_quality(normalized: Image.Image) -> float:
+    """Per-channel q_i for grayscale-derived channels (pHash, tone) — see
+    MULTI_CHANNEL_SCORING.md §3.6. Returns sqrt(entropy_norm * variance_norm)
+    bounded to [0, 1]. Geometric mean — a uniform-color image fails on both
+    axes and returns ~0; a high-information image returns near 1.
+
+    `normalized` must already be the grayscale, normalized PIL Image
+    produced by `normalize_image` (same input that goes into the hasher).
+    """
+    arr = np.asarray(normalized).astype(np.float64)
+    var_norm = min(1.0, float(arr.var()) / (100.0 * 100.0))
+    hist, _ = np.histogram(arr, bins=256, range=(0.0, 256.0))
+    total = hist.sum()
+    if total <= 0:
+        return 0.0
+    p = hist / total
+    p = p[p > 0]
+    entropy = float(-(p * np.log2(p)).sum())  # max 8 bits for 8-bit grayscale
+    entropy_norm = min(1.0, entropy / 8.0)
+    return float(np.sqrt(entropy_norm * var_norm))
+
+
 def hash_image_bytes(data: bytes, algorithm: str = "phash", hash_size: int = 16):
-    """Returns an imagehash, or None if the source is too low-variance to
-    produce a reliable hash. Near-uniform images (all-black sprite frames
-    at fade-in/out, blank placeholder thumbs, generic icons) yield
-    degenerate pHashes that match each other at sim=1.0 — catastrophic
-    false positives. We refuse to hash them. Callers must handle None."""
+    """Returns (imagehash, quality) or None if the source is too low-variance
+    to produce a reliable hash. Near-uniform images (all-black sprite frames
+    at fade-in/out, blank placeholder thumbs, generic icons) yield degenerate
+    pHashes that match each other at sim=1.0 — catastrophic false positives.
+    We refuse to hash them. Callers must handle None.
+
+    Quality is per-image q_i for the grayscale-derived channels
+    (pHash and tone share the same formula); see MULTI_CHANNEL_SCORING.md §3.6.
+    Phase 2: stored alongside the hash but not yet consulted by scoring.
+    """
     img = Image.open(io.BytesIO(data))
     normalized = normalize_image(img)
     if np.asarray(normalized).var() < LOW_VARIANCE_THRESHOLD:
         return None
-    return compute_hash(normalized, algorithm, hash_size)
+    h = compute_hash(normalized, algorithm, hash_size)
+    q = compute_quality(normalized)
+    return h, q
 
 
 def hex_to_hash(s: str):

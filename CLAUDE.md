@@ -166,69 +166,70 @@ The full breakdown is observable via `?debug=1` on `/match/*` endpoints (search 
 
 ---
 
-## 13. Image scores are aggregated as `top-K mean over the flat M×N pair set`, with K = number of extractor images
+## 13. Image scoring is multi-channel; channels compose by `max + bonus`, never by averaging or product
 
-> **Every Stash-side hash compared against every extractor-side hash. The flat M×N similarity set is then aggregated by taking the mean of the top K values, where K is the number of usable extractor images. Threshold gates the *aggregate*, not individual pair sims.**
+> **Three channels evaluate the (scene, record) pair independently. Each produces a score in [0, 1]. The composite is `max(fired_channels) + bonus_per_extra_firing_channel`, capped at 1.0. The threshold in `config.py` gates the composite, not individual channels and not individual pair sims.**
 
-Exact image matches between independently-encoded scenes are rare. A scene that genuinely matches an extractor record produces multiple medium-to-strong similarities scattered through the M×N pair grid; an unrelated scene produces a flat distribution of low values with the occasional spurious outlier (hash collision, shared decorative asset, etc.). The aggregation must distinguish "K consistent strong pairs" (real match) from "one outlier strong pair + many weak" (false positive).
+Single-channel pHash matching has a structural failure mode: it works for visually monolithic content (one stable subject) and degrades to noise the moment a video has scene changes, lighting variation, or varied subjects — exactly the population the bridge exists to serve. No aggregation algebra over a single channel rescues this. The fix is structural: provide complementary signals (chromatic, tonal) that survive what pHash misses, and compose them as union-of-evidence, mirroring §12's filename pattern.
 
-### The aggregation: `top_k_mean(sims, k=N)` where N = |extractor images|
+### The three channels
+
+| Channel | What it catches | What it misses |
+|---|---|---|
+| **A — pHash per-frame** | Direct structural match (DCT-based). | Scene variation, lighting, varied subjects. |
+| **B — color histogram, scene-aggregate** | Whole-scene chromatic profile, robust across cuts. | Records sharing generic palettes (sepia, low-light, monochrome). |
+| **C — low-res tone (8×8 gray) per-frame** | Coarse composition/luminance. | High-frequency texture. |
+
+Channel B's "aggregate" is per-scene (Stash side) and per-record (extractor side) — the per-bin median across all usable frames in scope. Per-bin (not per-frame) median is robust to outlier frames (black, fade transitions) without depending on the binary filters being perfect.
+
+### Within-channel scoring (per channel, applied independently)
+
+For frame-level channels (A, C): per record image `i`, take `m_i = max_j sim(stash_j, ext_i)`. For aggregate channel (B): one similarity `s_B` between Stash-side and extractor-side aggregate features. Then in both:
+
+1. **Sharpen**: `m_i' = max(0, (m_i - baseline) / (1 - baseline))^γ` with γ from config (default 2). Subtracts the per-channel noise floor; gamma suppresses fuzzy near-baseline matches.
+2. **Weight by quality + uniqueness**: `w_i = q_i * c_i`. `q_i` is intrinsic, channel-specific: pHash and tone use `sqrt(grayscale_entropy_norm * variance_norm)`; color histogram uses `1 - gini(hist_bins)`. `c_i` is corpus-relative, computed as the smoothed reciprocal `1 / (1 + α * matches_in_other_records)` with α from config (default 1.0). Stash-side `c_i = 1`.
+3. **Evidence-union** (frame-level channels): `E = 1 - Π(1 - w_i * m_i')`. Soft-OR is now safe because `m_i'` is post-sharpening and `w_i` suppresses low-quality / non-unique images — the single-outlier saturation that broke the old top-K-mean model is gated away by the weights.
+4. **Count saturation**: `count_conf = 1 - exp(-Σw_i / k)` with `k` from config (default 2.0). A record with N=1 image earns less than N=10 with the same evidence — sparse evidence is less reliable.
+5. **Distribution shape**: `dist_q = 0.5 + 0.5 * normalized_entropy(m_i')`. Broad coverage outranks single spikes.
+6. **Channel score**: `S_channel = E * count_conf * dist_q`. For aggregate channel B (no distribution): `S_B = m_B' * q_B`.
+
+### Cross-channel composition
 
 ```
-score = mean(sorted(sims, reverse=True)[:N])
+fired = [S for S in (S_A, S_B, S_C) if S >= min_contribution]
+composite = min(1.0, max(fired) + bonus_per_extra * (len(fired) - 1))
 ```
 
-- Bounded `[0, 1]` — composes cleanly with the search score (`+= contribution`, capped at 1.0).
-- For each extractor image, you'd hope to see at least one strong sprite-frame match in a real match. Top-N picks the N best pairs in the entire grid as the record's strongest evidence; mean averages them.
+This is the §12 filename pattern: union-of-evidence with a structured bonus for corroboration. Each channel weak alone, union strong.
 
-### Worked examples
+### Threshold gates the composite
 
-Real match (M=8 sprite frames × N=5 extractor images = 40 pairs; ~5 strong pairs at 0.85, ~35 weak at 0.15):
-- top-5 ≈ [0.85, 0.85, 0.85, 0.85, 0.85] → **0.85**
+- **Scrape**: `composite >= threshold` → image tier fires. Otherwise, falls through.
+- **Search**: `composite` contributes to the rank score; no threshold gate.
 
-False match (one shared/coincident image hashing identically to one sprite frame; the rest of the record's images are unrelated):
-- top-5 = [1.0, 0.15, 0.15, 0.15, 0.15] → **0.36**
+### Filtering — must happen before any aggregation
 
-A 0.5 threshold then admits the real match and rejects the false. Note the threshold is on the **aggregate**, not on individual pair sims — that's what kills the one-outlier false positive.
+The per-image filtering rules still apply, per-image and per-channel:
 
-### Why we ditched the previous strategies
+1. **404 / fetch failure** (`extractor/client.fetch_asset` returns `None`). Drop the ref entirely from all channels.
+2. **Low pixel variance at hash time** (`imgmatch/image_comparison.hash_image_bytes` returns `None`). Catches all-black sprite frames at the source.
+3. **Degenerate-hash check at sim time** (`_is_degenerate_hash`). Belt-and-braces for any hash with bit-density outside `[10%, 90%]`. Affects only channel A.
 
-- **Per-extractor-image collapse + peak+mean** (previous attempt): per-image collapse takes max-across-frames for each extractor image, producing N values; peak+mean aggregates those. Worked on the user's `[0.1, 0.1, 0.1, 1.0]` toy example (scored 0.66) but didn't reflect the user's actual intent — they want the full M×N pair distribution evaluated, not the dimension-collapsed N-vector.
-- **Soft-OR** (`1 - prod(1 - s)`): saturates at 1.0 the moment any single sim is 1.0. One shared/coincident image (hash collision on real-but-unrelated content) pinned the aggregate to 1.0 regardless of the rest of the record. Variance and degeneracy filters help but can't catch real-content collisions.
-- **Max alone**: same failure mode as soft-OR — single outlier dominates.
-- **Mean over flat M×N**: ignores the strong-match signal. A real match's strong pairs get diluted by 30+ weak frame×unrelated-image pairs.
-- **Peak + mean over flat M×N**: the dilution from M×N pairs makes mean tiny, so the score collapses to roughly `(peak + small)/2 ≈ peak/2`. Single-outlier false positives still win — verified arithmetically on the field-observed case.
+A filter failure on one channel does not exclude the image from other channels — channel A might filter a frame for low pHash variance while channel B still uses its color histogram.
 
-Top-K mean dodges all these:
-- Outlier 1.0 in a sea of low sims → top-K still includes the K-1 weak runners-up → mean drops it.
-- Mean over the full flat set → would average 35+ weak pairs in; top-K avoids that.
-- Max → ignores corroborating matches; top-K rewards them.
+### Featurization lifecycle
 
-### K = number of extractor images, not min(M,N) or max(M,N)
+Per-record features and per-job corpus statistics (baselines, uniqueness) are computed eagerly at container startup for any job not in `ready` state, and re-computed on cascade invalidation (`completed_at` advance) and on first request for never-seen jobs. The bridge returns `503 Service Unavailable` + `Retry-After` for any non-`ready` job — the hot path is `ready` → 200, everything else → 503. Single in-flight task per `job_id`; bounded global concurrency (`BRIDGE_FEATURIZE_CONCURRENCY`). See `MULTI_CHANNEL_SCORING.md` §4 for the state machine.
 
-The semantics are "for each extractor image we'd hope to see one strong sprite-frame match." That's N expected strong pairs. K = N is the natural fit. Note that top-N over an M×N grid can pick multiple strong pairs from the same extractor image (when adjacent sprite frames are visually similar) — this is fine; redundant matches are still corroborating evidence, just less than N truly independent matches.
+### Don'ts
 
-When the record has only N=1 extractor image, K=1 and the aggregate degenerates to `max(sims)` — for a 1-image record that's the only sensible answer, and the threshold guards against accepting a single weak match as definitive.
-
-### Threshold gates the aggregate, not individual sims
-
-In scrape mode the threshold is now applied to the top-K mean: `aggregate >= threshold → fires`. This is a deliberate change from the prior "any sim ≥ threshold" gate. With the new gate:
-- A single 1.0 sim no longer bypasses the threshold automatically.
-- A consistent set of moderate matches (e.g. all sims ≈ 0.65 with threshold 0.6) DOES fire, because the aggregate carries evidence that one sim alone wouldn't.
-
-**Don't**: switch back to per-extractor-image collapse — the user's intent is full M×N evaluation. **Don't**: switch back to soft-OR — saturation re-introduces the false-positive class. **Don't**: gate the threshold on individual sims — that re-introduces the one-outlier vector. **Don't**: change K without thinking through whether the new value preserves "one expected strong match per extractor image" semantics.
-
-### Input filtering — must happen *before* aggregation
-
-Soft-OR's "one strong match dominates" property cuts both ways: a single bad sim of 1.0 will saturate the aggregate to 1.0 regardless of every other signal. So images that can produce spurious 1.0 sims must be filtered out before they ever reach `_sim`. Three filters apply, in order:
-
-1. **404 / fetch failure** (`extractor/client.fetch_asset` returns `None`). Not every record's `images[]` was successfully downloaded by the extractor. Callers must drop refs whose hash is `None` from the per-image sims list — *not* append a 0.0 entry.
-2. **Low pixel variance at hash time** (`imgmatch/image_comparison.hash_image_bytes` returns `None` if `np.var(normalized) < LOW_VARIANCE_THRESHOLD`). Catches all-black sprite frames (fade-in/out) and blank/placeholder extractor images at the source — they never produce a hash, never get cached, never participate.
-3. **Degenerate-hash check at sim time** (`_is_degenerate_hash`). Belt-and-braces: a pHash with bit-density outside `[10%, 90%]` came from a near-uniform source. Catches anything that snuck through (e.g. a hash cached before filter #2 was added). `_sim` returns 0 on either operand being degenerate.
-
-**Why this ordering**: filter #1 saves bandwidth (don't fetch what's known-missing), filter #2 saves cache and compute (don't hash uniform pixels), filter #3 is the safety net. All three result in the same downstream behavior: the ref is *omitted* from the per-image sims list. The list length should equal the number of usable comparisons, not the number of attempted ones.
-
-**Don't**: append `0.0` entries for failed/uniform images — they're noise in debug output and tempt future maintainers to "fix" them. **Don't**: cache the string `"None"` as a hash — old code path; check that any new caller of `_hash_or_compute` handles `h is None` correctly (skip the cache write, return None to caller).
+- **Don't** revert to single-channel scoring "because it's simpler" — single-channel was the bug.
+- **Don't** compose channels by mean or product. Mean dilutes a strong channel's signal; product zeros the composite when one channel doesn't fire.
+- **Don't** introduce per-channel thresholds. The threshold is on the composite. Per-channel `min_contribution` is a *firing-detection* parameter for the bonus, not a gate on the channel's output.
+- **Don't** populate Stash-side `c_i`. There is no Stash corpus that meaningfully participates in IDF; using `c_i = 1` is correct for the Stash side.
+- **Don't** featurize synchronously inside the request hot path. The 503/Retry-After protocol is the contract; eager-at-startup absorbs the latency cost out of band.
+- **Don't** use IDF (`log(N/n)/log(N)`) for `c_i`. Records typically have N ≤ 5; IDF collapses too fast at small N. The smoothed reciprocal is the canonical form.
+- **Don't** append `0.0` entries for failed/uniform images — they're noise and tempt future maintainers to "fix" them. The list length should equal the number of usable comparisons, not the number of attempted ones.
 
 ---
 
@@ -239,7 +240,8 @@ Soft-OR's "one strong match dominates" property cuts both ways: a single bad sim
 | Wrong scene returned in scrape | `bridge/app/matching/scrape.py` cascade order; check candidate's `id`, `title`, image_sim values in logs |
 | Search results in odd order | `bridge/app/matching/search.py`; verify `min(score, 1.0)` cap; check tiebreak by `result_index` |
 | "No result" when one was expected | §5 studio filter — does scene have a studio that matches a job name? §6 schema superset — does the job's schema actually have all canonical fields? |
-| Image match never fires | Asset URL resolution — extractor records use `../assets/<file>` which must rewrite to `/api/asset/{job_id}/assets/<file>`. Check ETag handling. |
+| Image match never fires | (a) §13 channel composite below `image_threshold` — request `?debug=1` and inspect `_debug.image.channels.*.S` per channel + `composite`. (b) Asset URL resolution — extractor records use `../assets/<file>` which must rewrite to `/api/asset/{job_id}/assets/<file>`. Check ETag handling. |
+| One channel always scores 0 | Featurization didn't run for that channel — check `corpus_stats` rows for the job/channel pair. May indicate a per-image compute failure (e.g. PIL can't decode the asset for tone) or an empty `image_features` row set for that channel. |
 | Performer match always 0 | Alias index freshness — check TTL, check `findPerformers` query uses both `name` and `aliases` filters with `OR` |
 | Cache returning stale results | §7 — `completed_at` change should have triggered cascade. Check `extractor_jobs.completed_at` against fresh `GET /api/jobs/{id}` |
 | 400 Bad Request from bridge | §1 — scraper's `config.py` is missing a required parameter; the bridge has no fallback |
