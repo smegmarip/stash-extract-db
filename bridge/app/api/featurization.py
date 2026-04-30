@@ -1,4 +1,4 @@
-"""Featurization status endpoints — see MULTI_CHANNEL_SCORING.md §4.7.
+"""Featurization status endpoints — see CLAUDE.md §14.7.
 
 Per-job:    GET /api/extraction/{job_id}/features
 Fleet:      GET /api/featurization/status

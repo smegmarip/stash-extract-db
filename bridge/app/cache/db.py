@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS match_results (
 );
 
 -- Multi-channel image features. Replaces image_hashes after migration.
--- See MULTI_CHANNEL_SCORING.md §2.1.
+-- See CLAUDE.md §15.
 CREATE TABLE IF NOT EXISTS image_features (
   source           TEXT NOT NULL,
   ref_id           TEXT NOT NULL,
@@ -157,7 +157,7 @@ async def upsert_job_and_results(
 ) -> None:
     """Atomically replace the job row + all of its results.
 
-    Cascade per CLAUDE.md §7 + MULTI_CHANNEL_SCORING.md §4.8: deleting the
+    Cascade per CLAUDE.md §7 + §14.5: deleting the
     extractor_jobs row cascades via FK to extractor_results, corpus_stats,
     image_uniqueness, and job_feature_state. match_results and the
     extractor-side image_features rows have no FK and are deleted manually.
@@ -233,7 +233,7 @@ async def set_image_hash(source: str, ref_id: str, fingerprint: str, algorithm: 
     await db().commit()
 
 
-# --- image_features (multi-channel; will replace image_hashes — see MULTI_CHANNEL_SCORING.md) -----
+# --- image_features (multi-channel; will replace image_hashes — see CLAUDE.md §15) -----
 
 _STASH_SOURCES = ("stash_cover", "stash_sprite", "stash_aggregate")
 
@@ -248,7 +248,7 @@ async def get_image_feature(
     cached blob is stale).
 
     Side effect: on a Stash-side hit, updates `last_accessed_at` to support
-    LRU eviction (Phase 6 + MULTI_CHANNEL_SCORING.md §6.4). Extractor-side
+    LRU eviction (CLAUDE.md §14.9). Extractor-side
     rows skip the touch — they're cleared by job-cascade invalidation, not
     LRU, and the write would just create cache pressure.
     """

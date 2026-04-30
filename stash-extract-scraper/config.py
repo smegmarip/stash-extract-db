@@ -37,7 +37,7 @@ SPRITE_SAMPLE_SIZE = 8
 REQUEST_TIMEOUT_S = 90
 
 # --- Multi-channel scoring (used when bridge has BRIDGE_NEW_SCORING_ENABLED=true)
-# See MULTI_CHANNEL_SCORING.md §3 for the formulas these tune.
+# See CLAUDE.md §13 for the formulas these tune.
 
 # Sharpening exponent: higher → stronger suppression of noise-floor
 # similarities. 3.5 is the calibrated peak on a diverse 491-video Pexels

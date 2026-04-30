@@ -72,8 +72,7 @@ def hash_sprite_frames(
     """Returns a list of `(imagehash, quality)` tuples — one per sampled frame.
 
     Quality is per-frame q_i for grayscale-derived channels (pHash and tone
-    share the same formula); see MULTI_CHANNEL_SCORING.md §3.6. Phase 2:
-    stored alongside the hash but not yet consulted by scoring.
+    share the same formula); see CLAUDE.md §13.4.
     """
     sprite_img = Image.open(io.BytesIO(sprite_bytes))
     vtt_frames = parse_vtt(decode_vtt_text(vtt_text))

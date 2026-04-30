@@ -3,7 +3,7 @@
 Per CLAUDE.md §7: extractor_jobs.completed_at is the only invalidation
 trigger for extractor result rows. On mismatch, replace atomically.
 
-Per MULTI_CHANNEL_SCORING.md §4.8: completed_at advance also triggers
+Per CLAUDE.md §14.5: completed_at advance also triggers
 re-featurization. The cascade in cdb.upsert_job_and_results clears feature
 data atomically; this module re-enqueues a featurization task after commit
 so the bridge self-heals without waiting for the next request.

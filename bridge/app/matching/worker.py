@@ -1,7 +1,7 @@
 """Featurization worker pool.
 
 Bounded global concurrency (BRIDGE_FEATURIZE_CONCURRENCY) plus a single
-in-flight task per job_id. See MULTI_CHANNEL_SCORING.md §4.3 + §4.10.
+in-flight task per job_id. See CLAUDE.md §14.3 + §14.6.
 
 Lifecycle integration points (wired in main.py):
 - startup_recover() — runs after init_db on container start

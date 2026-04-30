@@ -49,7 +49,7 @@ def _scene_oshash(scene: dict[str, Any]) -> str:
 def _phash_algo_key(algorithm: str, hash_size: int) -> str:
     """Combined algorithm string for image_features (e.g. 'phash:8'). The
     legacy image_hashes table keeps algorithm and hash_size as separate
-    columns — see MULTI_CHANNEL_SCORING.md §2.1 for the rationale."""
+    columns — see CLAUDE.md §15 for the rationale."""
     return f"{algorithm}:{hash_size}"
 
 

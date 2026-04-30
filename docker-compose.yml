@@ -12,7 +12,7 @@ services:
       EXTRACTOR_URL: "${EXTRACTOR_URL:-http://extractor-gateway:12000}"
       DATA_DIR: "/data"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-      # Multi-channel scoring lifecycle (see HOW_TO_USE.md)
+      # Multi-channel scoring lifecycle (see docs/HOW_TO_USE.md)
       BRIDGE_LIFECYCLE_ENABLED: "${BRIDGE_LIFECYCLE_ENABLED:-false}"
       BRIDGE_NEW_SCORING_ENABLED: "${BRIDGE_NEW_SCORING_ENABLED:-false}"
       BRIDGE_FEATURIZE_CONCURRENCY: "${BRIDGE_FEATURIZE_CONCURRENCY:-4}"

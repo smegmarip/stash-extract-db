@@ -75,7 +75,7 @@ LOW_VARIANCE_THRESHOLD = 30.0
 
 def compute_quality(normalized: Image.Image) -> float:
     """Per-channel q_i for grayscale-derived channels (pHash, tone) — see
-    MULTI_CHANNEL_SCORING.md §3.6. Returns sqrt(entropy_norm * variance_norm)
+    CLAUDE.md §13.4. Returns sqrt(entropy_norm * variance_norm)
     bounded to [0, 1]. Geometric mean — a uniform-color image fails on both
     axes and returns ~0; a high-information image returns near 1.
 
@@ -103,8 +103,7 @@ def hash_image_bytes(data: bytes, algorithm: str = "phash", hash_size: int = 16)
     We refuse to hash them. Callers must handle None.
 
     Quality is per-image q_i for the grayscale-derived channels
-    (pHash and tone share the same formula); see MULTI_CHANNEL_SCORING.md §3.6.
-    Phase 2: stored alongside the hash but not yet consulted by scoring.
+    (pHash and tone share the same formula); see CLAUDE.md §13.4.
     """
     img = Image.open(io.BytesIO(data))
     normalized = normalize_image(img)

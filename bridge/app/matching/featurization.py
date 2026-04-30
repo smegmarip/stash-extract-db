@@ -1,8 +1,8 @@
 """Per-job featurization.
 
 Computes per-(record image, channel) features, per-job channel baselines,
-and per-(record image, channel) uniqueness. See MULTI_CHANNEL_SCORING.md
-§4.4 for the task body and §3 for the formulas.
+and per-(record image, channel) uniqueness. See CLAUDE.md §14 for the
+task lifecycle and §13 for the formulas.
 
 Phase 5 ships all three channels: A (pHash), B (color histogram, per-record
 aggregate), C (low-res tone). Channel B's per-record aggregate is stored

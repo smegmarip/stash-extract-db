@@ -95,7 +95,7 @@ def _select_jobs_by_studio(jobs: list[dict[str, Any]], studio_name: Optional[str
 
 
 async def _gate_features_ready(jobs: list[dict[str, Any]]) -> None:
-    """Per MULTI_CHANNEL_SCORING.md §4.2: any non-`ready` job in the
+    """Per CLAUDE.md §14.2: any non-`ready` job in the
     candidate set produces a 503 + Retry-After. Enqueue all non-ready jobs
     so the bridge starts working immediately.
 

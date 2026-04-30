@@ -1,10 +1,10 @@
 """Channel B (color histogram) and channel C (low-res tone) features.
 
-Per MULTI_CHANNEL_SCORING.md §3.1, §3.6, §3.7. All functions are pure
+Per CLAUDE.md §13.1, §13.4, §13.5. All functions are pure
 compute on PIL Images / numpy arrays; the bridge fetches bytes via the
 stash/extractor clients and passes them in.
 
-Compact storage formats (§2.2):
+Compact storage formats:
 - color_hist:hsv:4x4x4 → 64 uint8 bin counts (normalized so max bin = 255)
 - tone:gray:8x8       → 64 uint8 luminance values
 

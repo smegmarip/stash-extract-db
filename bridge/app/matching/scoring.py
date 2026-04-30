@@ -1,6 +1,6 @@
 """Within-channel scoring + cross-channel composition.
 
-Implements MULTI_CHANNEL_SCORING.md §3.2 (within-channel) and §3.3
+Implements CLAUDE.md §13.2 (within-channel) and §13.3
 (cross-channel composition). Pure compute — no I/O. Inputs are arrays
 of similarities, quality, uniqueness; output is bounded [0, 1].
 

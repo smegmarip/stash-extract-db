@@ -11,7 +11,7 @@ class Settings(BaseSettings):
     data_dir: str = "/data"
     log_level: str = "INFO"
 
-    # Featurization lifecycle (MULTI_CHANNEL_SCORING.md §4).
+    # Featurization lifecycle (CLAUDE.md §14).
     # When false, the bridge falls back to on-demand caching against
     # image_hashes (Phase 2 dual-write still active) — used as the rollback
     # path for Phase 3+. When true, /match endpoints gate on job_feature_state
@@ -86,7 +86,7 @@ class Settings(BaseSettings):
     # of all reads coming from image_features — this stops the dual write
     # and the legacy fallback. The actual `DROP TABLE image_hashes` is a
     # manual operation the user runs once they're confident in the new
-    # path; see HOW_TO_USE.md §10.
+    # path; see docs/HOW_TO_USE.md §7.3.
     bridge_legacy_dual_write_enabled: bool = True
 
     class Config:

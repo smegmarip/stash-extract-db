@@ -49,7 +49,7 @@ async def scrape(
     # Tier 3: Image — fires when the image-channel composite clears the
     # threshold for this candidate. The scoring path is selected by
     # BRIDGE_NEW_SCORING_ENABLED:
-    #   - new (Phase 4+): within-channel formula per MULTI_CHANNEL_SCORING.md §3
+    #   - new (Phase 4+): within-channel formula per CLAUDE.md §13
     #   - legacy: top-K-mean over flat M×N pair set (CLAUDE.md §13 prior)
     use_new = settings.bridge_new_scoring_enabled
     use_multi = bool(use_new and image_channels and len(image_channels) >= 1
