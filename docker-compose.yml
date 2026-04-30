@@ -6,29 +6,35 @@ services:
     ports:
       - "${BRIDGE_PORT:-13000}:13000"
     environment:
+      # Connection / auth
       STASH_URL: "${STASH_URL:-http://host.docker.internal:9999}"
       STASH_API_KEY: "${STASH_API_KEY:-}"
       STASH_SESSION_COOKIE: "${STASH_SESSION_COOKIE:-}"
       EXTRACTOR_URL: "${EXTRACTOR_URL:-http://extractor-gateway:12000}"
       DATA_DIR: "/data"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
-      # Multi-channel scoring lifecycle (see docs/HOW_TO_USE.md)
+
+      # Lifecycle (operational toggles; see docs/HOW_TO_USE.md §7)
       BRIDGE_LIFECYCLE_ENABLED: "${BRIDGE_LIFECYCLE_ENABLED:-true}"
       BRIDGE_NEW_SCORING_ENABLED: "${BRIDGE_NEW_SCORING_ENABLED:-true}"
+
+      # Featurization concurrency (operational; tune to hardware)
       BRIDGE_FEATURIZE_CONCURRENCY: "${BRIDGE_FEATURIZE_CONCURRENCY:-4}"
       BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY: "${BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY:-8}"
-      BRIDGE_FEATURIZE_ALGORITHM: "${BRIDGE_FEATURIZE_ALGORITHM:-phash}"
-      BRIDGE_FEATURIZE_HASH_SIZE: "${BRIDGE_FEATURIZE_HASH_SIZE:-16}"
-      BRIDGE_FEATURIZE_UNIQUENESS_ALPHA: "${BRIDGE_FEATURIZE_UNIQUENESS_ALPHA:-1.0}"
-      BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD: "${BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD:-0.85}"
-      BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH: "${BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH:-}"
-      BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE: "${BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE:-}"
-      BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH: "${BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH:-}"
-      BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE: "${BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE:-}"
       BRIDGE_STALE_TASK_MS: "${BRIDGE_STALE_TASK_MS:-600000}"
+
+      # LRU eviction (operational; depends on disk budget)
       BRIDGE_STASH_FEATURE_BUDGET_BYTES: "${BRIDGE_STASH_FEATURE_BUDGET_BYTES:-1073741824}"
       BRIDGE_LRU_EVICTION_INTERVAL_S: "${BRIDGE_LRU_EVICTION_INTERVAL_S:-3600}"
+
+      # Phase 7 dual-write retirement (one-time op; see HOW_TO_USE.md §7.3)
       BRIDGE_LEGACY_DUAL_WRITE_ENABLED: "${BRIDGE_LEGACY_DUAL_WRITE_ENABLED:-true}"
+
+      # Match-time scoring values, hash config, and per-channel uniqueness
+      # overrides are calibrated bridge behavior — defaults live in
+      # bridge/app/settings.py and are NOT exposed here. They can be
+      # overridden in this file as a development/debugging escape hatch
+      # if absolutely required, but doing so is anti-service-design.
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:

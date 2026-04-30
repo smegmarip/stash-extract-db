@@ -1,5 +1,6 @@
 from typing import Optional
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -10,6 +11,46 @@ class Settings(BaseSettings):
     extractor_url: str = "http://extractor-gateway:12000"
     data_dir: str = "/data"
     log_level: str = "INFO"
+
+    # --- Match-time scoring config (CLAUDE.md §1, §13). Owned by the
+    # bridge; the scraper is a metadata transport and does not send these.
+    # All have calibrated defaults from the 491-video Pexels corpus
+    # (docs/calibration/CALIBRATION_RESULTS.md).
+    bridge_image_mode: str = "cover"            # cover | sprite | both
+    bridge_image_threshold: float = 0.7         # scrape-mode image-tier gate
+    bridge_search_limit: int = 5                # top-N for search mode
+    bridge_hash_algorithm: str = "phash"        # phash | dhash | ahash | whash
+    bridge_hash_size: int = 16                  # hash bit size
+    bridge_sprite_sample_size: int = 8          # sprite frames per scene
+    bridge_image_gamma: float = 3.5             # Run 3a peak
+    bridge_image_count_k: float = 0.25          # Run 3c peak
+    bridge_image_min_contribution: float = 0.05 # Run 3b peak
+    bridge_image_bonus_per_extra: float = 0.1
+    bridge_image_channels: list[str] = ["phash", "color_hist", "tone"]
+    bridge_image_search_floor: Optional[float] = None  # mechanism shipped, default off (Run 6)
+
+    @field_validator("bridge_image_channels", mode="before")
+    @classmethod
+    def _parse_channels(cls, v):
+        """Accept comma-separated string from env, list[str] from defaults."""
+        if isinstance(v, str):
+            return [c.strip() for c in v.split(",") if c.strip()]
+        return v
+
+    @field_validator(
+        "bridge_image_search_floor",
+        "bridge_featurize_uniqueness_threshold_phash",
+        "bridge_featurize_uniqueness_threshold_tone",
+        "bridge_featurize_uniqueness_alpha_phash",
+        "bridge_featurize_uniqueness_alpha_tone",
+        mode="before",
+    )
+    @classmethod
+    def _empty_optional_float_to_none(cls, v):
+        """Empty-string env var → None (the documented "disabled"/inherit default)."""
+        if v == "" or v is None:
+            return None
+        return v
 
     # Featurization lifecycle (CLAUDE.md §14).
     # When false, the bridge falls back to on-demand caching against
@@ -22,17 +63,10 @@ class Settings(BaseSettings):
     # this gets reset on startup. 10 minutes is generous for typical jobs.
     bridge_stale_task_ms: int = 10 * 60 * 1000
 
-    # Featurization parameters. In Phase 3 the bridge picks one algorithm
-    # for its server-triggered featurization runs; matching requests still
-    # use whatever the scraper sends (their results land in image_features
-    # via Phase 2 dual-write, but may use a different algorithm). Phase 4
-    # unifies these so featurization is request-driven.
-    bridge_featurize_algorithm: str = "phash"
-    # Aligned with the scraper's HASH_SIZE default (config.py). If the
-    # bridge featurizes at a different size than the scraper sends in
-    # match requests, image_features rows can't be reused and the
-    # request falls through to on-demand compute.
-    bridge_featurize_hash_size: int = 16
+    # NOTE: featurization uses settings.bridge_hash_algorithm and
+    # settings.bridge_hash_size (declared above) — there's no longer a
+    # separate "featurize-side" hash config since the scraper no longer
+    # carries one. One value, used everywhere the bridge hashes images.
     # c_i smoothing per §4.6 — used in featurization until Phase 4 hands
     # this off to the scraper config. The "global" values below are the
     # historical single setting; per-channel overrides (added in

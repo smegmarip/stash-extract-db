@@ -54,17 +54,6 @@ async def scrape(
     use_new = settings.bridge_new_scoring_enabled
     use_multi = bool(use_new and image_channels and len(image_channels) >= 1
                      and set(image_channels) != {"phash"})
-    if use_new:
-        if image_gamma is None or image_count_k is None:
-            raise HTTPException(
-                status_code=400,
-                detail="image_gamma and image_count_k are required when BRIDGE_NEW_SCORING_ENABLED is true",
-            )
-    if use_multi and (image_min_contribution is None or image_bonus_per_extra is None):
-        raise HTTPException(
-            status_code=400,
-            detail="image_min_contribution and image_bonus_per_extra are required when image_channels has more than just 'phash'",
-        )
 
     matches: list[tuple[dict[str, Any], float]] = []
     for c in candidates:

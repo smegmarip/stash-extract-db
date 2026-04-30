@@ -255,7 +255,8 @@ async def match_by_url(req: UrlMatchRequest, debug: bool = Query(False)):
                 return out.model_dump(exclude_none=True)
             # search: prepend exact-URL hits with score=1.0; then continue.
             results = []
-            for h in hits[: req.limit]:
+            limit = req.limit if req.limit is not None else settings.bridge_search_limit
+            for h in hits[: limit]:
                 sr = await _record_to_scrape_result(h, None, alias_resolver)
                 d = sr.model_dump(exclude_none=True)
                 d["match_score"] = 1.0
@@ -292,6 +293,30 @@ async def _match_by_scene_id(scene_id: str, req, debug: bool = False):
     return await _match_with_scene(scene, req, studio_for_filter=studio, debug=debug)
 
 
+def _resolve_match_params(req) -> dict[str, Any]:
+    """Per CLAUDE.md §1: bridge owns scoring config. Where the scraper
+    sent a value, prefer it; otherwise fall back to `settings.bridge_*`.
+    Production scrapers send nothing here — they're metadata transports.
+    Test harnesses + manual curl invocations may override per-call.
+    """
+    return {
+        "image_mode":             req.image_mode             or settings.bridge_image_mode,
+        "threshold":              req.threshold              if req.threshold              is not None else settings.bridge_image_threshold,
+        "limit":                  req.limit                  if req.limit                  is not None else settings.bridge_search_limit,
+        "hash_algorithm":         req.hash_algorithm         or settings.bridge_hash_algorithm,
+        "hash_size":              req.hash_size              if req.hash_size              is not None else settings.bridge_hash_size,
+        "sprite_sample_size":     req.sprite_sample_size     if req.sprite_sample_size     is not None else settings.bridge_sprite_sample_size,
+        "image_gamma":            req.image_gamma            if req.image_gamma            is not None else settings.bridge_image_gamma,
+        "image_count_k":          req.image_count_k          if req.image_count_k          is not None else settings.bridge_image_count_k,
+        "image_channels":         req.image_channels         or settings.bridge_image_channels,
+        "image_min_contribution": req.image_min_contribution if req.image_min_contribution is not None else settings.bridge_image_min_contribution,
+        "image_bonus_per_extra":  req.image_bonus_per_extra  if req.image_bonus_per_extra  is not None else settings.bridge_image_bonus_per_extra,
+        # search_floor: None is a meaningful "disabled" value, so request
+        # None doesn't fall back to settings. Settings None → disabled too.
+        "image_search_floor":     req.image_search_floor if req.image_search_floor is not None else settings.bridge_image_search_floor,
+    }
+
+
 async def _match_with_scene(
     scene: dict[str, Any],
     req,
@@ -312,17 +337,18 @@ async def _match_with_scene(
         return [] if req.mode == "search" else {}
 
     alias_resolver = AliasResolver()
+    p = _resolve_match_params(req)
 
     if req.mode == "scrape":
         winner = await scrape_match(
             scene, pool, used_filter,
-            req.image_mode, req.threshold,
-            req.hash_algorithm, req.hash_size, req.sprite_sample_size,
-            image_gamma=req.image_gamma,
-            image_count_k=req.image_count_k,
-            image_channels=req.image_channels,
-            image_min_contribution=req.image_min_contribution,
-            image_bonus_per_extra=req.image_bonus_per_extra,
+            p["image_mode"], p["threshold"],
+            p["hash_algorithm"], p["hash_size"], p["sprite_sample_size"],
+            image_gamma=p["image_gamma"],
+            image_count_k=p["image_count_k"],
+            image_channels=p["image_channels"],
+            image_min_contribution=p["image_min_contribution"],
+            image_bonus_per_extra=p["image_bonus_per_extra"],
         )
         if not winner:
             return {}
@@ -332,15 +358,15 @@ async def _match_with_scene(
     # search
     ranked = await search_match(
         scene, pool, used_filter,
-        req.image_mode, req.threshold,
-        req.hash_algorithm, req.hash_size, req.sprite_sample_size,
-        req.limit, alias_resolver, debug=debug,
-        image_gamma=req.image_gamma,
-        image_count_k=req.image_count_k,
-        image_channels=req.image_channels,
-        image_min_contribution=req.image_min_contribution,
-        image_bonus_per_extra=req.image_bonus_per_extra,
-        image_search_floor=req.image_search_floor,
+        p["image_mode"], p["threshold"],
+        p["hash_algorithm"], p["hash_size"], p["sprite_sample_size"],
+        p["limit"], alias_resolver, debug=debug,
+        image_gamma=p["image_gamma"],
+        image_count_k=p["image_count_k"],
+        image_channels=p["image_channels"],
+        image_min_contribution=p["image_min_contribution"],
+        image_bonus_per_extra=p["image_bonus_per_extra"],
+        image_search_floor=p["image_search_floor"],
     )
     out: list[dict[str, Any]] = []
     for cand, score, dbg in ranked:

@@ -4,16 +4,18 @@ behind BRIDGE_NEW_SCORING_ENABLED.
 Covers:
   - score_image_channel_a end-to-end (against featurized data) picks the
     matching record over non-matching ones
-  - 400 raised when image_gamma / image_count_k missing while flag is on
   - Legacy top-K-mean path runs when flag is off
   - image_channels=["phash"] (single channel) does NOT require the
     multi-channel min_contribution / bonus_per_extra fields
+
+Per CLAUDE.md §1 the bridge owns scoring config and supplies defaults
+when the request omits a field, so the previous "400 on missing field"
+tests were removed in the config-ownership inversion.
 """
 import json
 from typing import Optional
 
 import pytest
-from fastapi import HTTPException
 
 from bridge.app.extractor import client as ex_client
 from bridge.app.stash import client as stash_client
@@ -134,54 +136,6 @@ class TestScoreImageChannelA:
         # Record 1 wins
         assert s_results[1] > s_results[0]
         assert s_results[1] > s_results[2]
-
-
-# --- Validation: 400 on missing fields when flag is on -------------------
-
-class TestRequestValidation:
-    async def test_scrape_400_when_gamma_missing(
-        self, bridge_db, clean_settings, mock_clients, reset_worker,
-    ):
-        from bridge.app.matching.scrape import scrape as do_scrape
-
-        clean_settings.bridge_new_scoring_enabled = True
-        records = [{"data": {"id": "r0", "cover_image": "imgA", "images": []}}]
-        await _seed_and_featurize(
-            bridge_db, reset_worker, clean_settings, mock_clients,
-            "j_v", records, {"imgA": 1},
-        )
-        _, set_scene = mock_clients
-        set_scene(b"")  # empty bytes — sets attribute even if unused
-
-        with pytest.raises(HTTPException) as exc_info:
-            await do_scrape(
-                _scene(), _candidates(records, "j_v"),
-                used_studio_filter=False,
-                image_mode="cover", threshold=0.05,
-                algorithm="phash", hash_size=8, sprite_sample_size=8,
-                image_gamma=None, image_count_k=None,
-            )
-        assert exc_info.value.status_code == 400
-
-    async def test_scrape_400_when_count_k_missing(
-        self, bridge_db, clean_settings, mock_clients, reset_worker,
-    ):
-        from bridge.app.matching.scrape import scrape as do_scrape
-
-        clean_settings.bridge_new_scoring_enabled = True
-        records = [{"data": {"id": "r0", "cover_image": "imgA", "images": []}}]
-        await _seed_and_featurize(
-            bridge_db, reset_worker, clean_settings, mock_clients,
-            "j_v", records, {"imgA": 1},
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await do_scrape(
-                _scene(), _candidates(records, "j_v"),
-                False, "cover", 0.05, "phash", 8, 8,
-                image_gamma=2.0, image_count_k=None,
-            )
-        assert exc_info.value.status_code == 400
 
 
 # --- Legacy fallback (flag off) ------------------------------------------

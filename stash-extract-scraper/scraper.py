@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Stash Extract Scraper — scraper script.
+"""Stash Extract Scraper — metadata transport.
 
-Stdlib-only transport adapter. Reads scraper input from stdin, calls the
-bridge service, writes the bridge's JSON response to stdout. The bridge
-holds all matching logic.
+Stdlib-only. Reads scraper input from stdin, calls the bridge service,
+writes the bridge's JSON response to stdout. The bridge holds all
+matching logic and scoring configuration (CLAUDE.md §1). This script's
+job is purely to bridge Stash's invocation contract to the bridge's
+HTTP API — no scoring knobs flow through here.
 
 argv[1] selects the Stash action mode: fragment | name | query | url.
 """
@@ -37,26 +39,6 @@ def _read_stdin_json():
         return {}
 
 
-def _common_params() -> dict:
-    return {
-        "image_mode": config.IMAGE_MODE,
-        "threshold": config.IMAGE_THRESHOLD,
-        "limit": config.SEARCH_LIMIT,
-        "hash_algorithm": config.HASH_ALGORITHM,
-        "hash_size": config.HASH_SIZE,
-        "sprite_sample_size": config.SPRITE_SAMPLE_SIZE,
-        # Multi-channel scoring (read by the bridge only when its
-        # BRIDGE_NEW_SCORING_ENABLED is set; safely ignored otherwise).
-        "image_gamma": getattr(config, "IMAGE_GAMMA", 2.0),
-        "image_count_k": getattr(config, "IMAGE_COUNT_K", 2.0),
-        "image_uniqueness_alpha": getattr(config, "IMAGE_UNIQUENESS_ALPHA", 1.0),
-        "image_channels": getattr(config, "IMAGE_CHANNELS", ["phash", "color_hist", "tone"]),
-        "image_min_contribution": getattr(config, "IMAGE_MIN_CONTRIBUTION", 0.3),
-        "image_bonus_per_extra": getattr(config, "IMAGE_BONUS_PER_EXTRA", 0.1),
-        "image_search_floor": getattr(config, "IMAGE_SEARCH_FLOOR", None),
-    }
-
-
 def _post(endpoint: str, body: dict) -> str:
     url = config.BRIDGE_URL.rstrip("/") + endpoint
     data = json.dumps(body).encode("utf-8")
@@ -84,7 +66,6 @@ def _post(endpoint: str, body: dict) -> str:
 def main():
     mode_arg = sys.argv[1] if len(sys.argv) > 1 else "fragment"
     payload = _read_stdin_json()
-    base = _common_params()
 
     if mode_arg == "fragment":
         # sceneByFragment — full scene fragment in stdin, look up by id
@@ -92,7 +73,7 @@ def main():
         if not scene_id:
             _emit({})
             return
-        body_text = _post("/match/fragment", {**base, "scene_id": scene_id, "mode": "scrape"})
+        body_text = _post("/match/fragment", {"scene_id": scene_id, "mode": "scrape"})
 
     elif mode_arg == "name":
         # sceneByName — Stash passes a search query
@@ -100,14 +81,14 @@ def main():
         if not name:
             print("[]")
             return
-        body_text = _post("/match/name", {**base, "name": name, "mode": "search"})
+        body_text = _post("/match/name", {"name": name, "mode": "search"})
 
     elif mode_arg == "query":
         # sceneByQueryFragment — user picked a search result; scrape it
         if payload.get("id"):
-            body_text = _post("/match/fragment", {**base, "scene_id": str(payload["id"]), "mode": "scrape"})
+            body_text = _post("/match/fragment", {"scene_id": str(payload["id"]), "mode": "scrape"})
         elif payload.get("url"):
-            body_text = _post("/match/url", {**base, "url": str(payload["url"]), "mode": "scrape"})
+            body_text = _post("/match/url", {"url": str(payload["url"]), "mode": "scrape"})
         else:
             _emit({})
             return
@@ -118,7 +99,7 @@ def main():
         if not url_in:
             _emit({})
             return
-        body_text = _post("/match/url", {**base, "url": url_in, "mode": "scrape"})
+        body_text = _post("/match/url", {"url": url_in, "mode": "scrape"})
 
     else:
         _eprint(f"scraper.py: unknown mode {mode_arg!r}")

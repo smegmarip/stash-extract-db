@@ -6,15 +6,23 @@ For _what_ to build, see [`requirements.md`](requirements.md). This file covers 
 
 ---
 
-## 1. Configuration ownership
+## 1. The bridge is a self-contained service; the scraper is a metadata transport
 
-> **All matching parameters originate in the scraper's `config.py`. The bridge has no fallback.**
+> **All matching configuration lives on the bridge. The scraper passes a scene identifier and reads back a result — nothing else flows through it.**
 
-Threshold, image mode, search limit, hash algorithm, hash size, sprite sample size — every match-shaping parameter is sent in every request from the scraper. If the bridge receives a request missing a required parameter, it returns `400 Bad Request`. The bridge does **not** ship default values for these.
+`stash-extract-db` is a black-box service. Input goes in (scene_id / url / name + mode), output comes out (Stash scraper-shaped JSON). The bridge owns:
 
-**Why**: there is exactly one place a user changes behavior — `~/.stash/scrapers/stash-extract-db/config.py`. Bridge env vars are for _infrastructure_ (URLs, auth, data dir, log level) and for the _featurization lifecycle_ (concurrency, eviction budget) — not heuristics. Drift between scraper config and bridge config is a class of bug we refuse to introduce.
+- Match-time scoring values (`bridge_image_gamma`, `bridge_image_count_k`, `bridge_image_min_contribution`, `bridge_image_bonus_per_extra`, `bridge_image_threshold`, `bridge_image_mode`, `bridge_image_channels`, `bridge_image_search_floor`, `bridge_search_limit`, `bridge_sprite_sample_size`).
+- Hash config (`bridge_hash_algorithm`, `bridge_hash_size`).
+- Featurization config (`bridge_featurize_*`).
 
-**Don't**: add `DEFAULT_THRESHOLD`, `DEFAULT_IMAGE_MODE`, etc. to bridge env. Don't read these from a JSON file on the bridge. The scraper is the single source of truth.
+These are **calibrated** values, not user knobs (§13.9). Defaults live in `bridge/app/settings.py`. If the request body includes any of these fields, the bridge prefers the request value (used by test harnesses + calibration sweeps); production scrapers send nothing.
+
+The scraper script (`stash-extract-scraper/`) is intentionally minimal: stdlib only, ~80 lines, two configurable values (`BRIDGE_URL`, `REQUEST_TIMEOUT_S`). It reads a scene fragment from stdin, POSTs `{scene_id, mode}` to the bridge, prints the bridge's response. Stash invokes scrapers with a scene fragment on stdin — Stash has no concept of scoring parameters and no mechanism to inject them. That's why this configuration cannot live on the scraper side: there's no carrier.
+
+**Why this matters**: per-scraper or per-deployment scoring config is a category error. The bridge serves the same extractor data regardless of who's asking; one bridge configuration applies to every scraper request. Putting scoring on the scraper side meant manual config-file maintenance every time calibration moved a default — and Stash had no way to deliver new values to existing scraper installs.
+
+**Don't**: add scoring fields to `stash-extract-scraper/config.py`. **Don't**: read scoring config from anywhere outside the bridge process. **Don't**: ship the scraper bundle with calibrated values that need to match the bridge — the values aren't the scraper's concern.
 
 ---
 
@@ -266,17 +274,25 @@ A filter failure on one channel does not exclude the image from other channels �
 
 ### 13.9 Calibrated defaults (provenance: [`docs/calibration/CALIBRATION_RESULTS.md`](docs/calibration/CALIBRATION_RESULTS.md))
 
-| Parameter                                  | Default | Source             |
-| ------------------------------------------ | ------- | ------------------ |
-| `image_gamma`                              | 3.5     | Run 3a peak (concave; γ=2.0 default lost 27 points to γ=3.5) |
-| `image_count_k`                            | 0.25    | Run 3c peak (sparse-N records were systematically under-weighted at k=2.0) |
-| `image_uniqueness_alpha` (request)         | 1.0     | Run 5b flat       |
-| `image_min_contribution`                   | 0.05    | Run 3b (higher values exclude weak-but-correct contributions more aggressively than weak-but-incorrect) |
-| `image_bonus_per_extra`                    | 0.1     | Unchanged         |
-| `image_search_floor`                       | None    | Run 6 (mechanism shipped, default disabled — composite distributions overlap on mixed-content) |
-| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD`    | 0.85    | Run 5a confirmed peak (concave, both directions degrade) |
-| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA`        | 1.0     | Run 5b flat       |
-| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_*`  | None    | Run 7 (per-channel mechanism shipped; tone-specific override unhelpful on Pexels-style corpora — c_i collapse silences a noisy channel, which is the desired behavior) |
+These are the bridge's calibrated behavior, not deployment-time knobs. Defaults live in `bridge/app/settings.py`.
+
+| Setting                                       | Default | Source             |
+| --------------------------------------------- | ------- | ------------------ |
+| `bridge_image_gamma`                          | 3.5     | Run 3a peak (concave; γ=2.0 default lost 27 points to γ=3.5) |
+| `bridge_image_count_k`                        | 0.25    | Run 3c peak (sparse-N records were systematically under-weighted at k=2.0) |
+| `bridge_image_min_contribution`               | 0.05    | Run 3b (higher values exclude weak-but-correct contributions more aggressively than weak-but-incorrect) |
+| `bridge_image_bonus_per_extra`                | 0.1     | Unchanged         |
+| `bridge_image_threshold`                      | 0.7     | Composite gate for scrape mode |
+| `bridge_image_mode`                           | `cover` | Stash screenshot only — fastest |
+| `bridge_image_channels`                       | `[phash, color_hist, tone]` | All three; Run 7 confirmed dropping `tone` is also valid on Pexels-style content |
+| `bridge_image_search_floor`                   | None    | Run 6 (mechanism shipped, default disabled — composite distributions overlap on mixed-content) |
+| `bridge_hash_algorithm`                       | `phash` | Used at featurization AND request time |
+| `bridge_hash_size`                            | 16      | Used at featurization AND request time |
+| `bridge_search_limit`                         | 5       | Top-N for search mode |
+| `bridge_sprite_sample_size`                   | 8       | Sprite frames per scene |
+| `bridge_featurize_uniqueness_threshold`       | 0.85    | Run 5a confirmed peak (concave, both directions degrade) |
+| `bridge_featurize_uniqueness_alpha`           | 1.0     | Run 5b flat       |
+| `bridge_featurize_uniqueness_*_phash/_tone`   | None    | Run 7 (per-channel mechanism present as escape hatch; tone-specific override unhelpful on Pexels-style corpora — c_i collapse silences a noisy channel, which is the desired behavior) |
 
 ### 13.10 Don'ts
 
@@ -493,7 +509,7 @@ While `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=true` (default): every pHash compute wri
 | One channel always scores 0                   | Featurization didn't run for that channel — check `corpus_stats` rows for the job/channel pair. May indicate a per-image compute failure (e.g. PIL can't decode the asset for tone) or an empty `image_features` row set for that channel.                                                    |
 | Performer match always 0                      | Alias index freshness — check TTL, check `findPerformers` query uses both `name` and `aliases` filters with `OR`                                                                                                                                                                              |
 | Cache returning stale results                 | §7 — `completed_at` change should have triggered cascade. Check `extractor_jobs.completed_at` against fresh `GET /api/jobs/{id}`                                                                                                                                                              |
-| 400 Bad Request from bridge                   | §1 — scraper's `config.py` is missing a required parameter; the bridge has no fallback                                                                                                                                                                                                        |
+| Calibrated values seem wrong on a corpus      | §13.9 — defaults are calibrated against a Pexels-style mixed-content corpus. If your real-world corpus is a poor fit (controlled-lighting studio content, monochrome film), that's a calibration-coverage gap, not a deploy-time tuning task. Re-calibrate against the new corpus and update `bridge/app/settings.py`. |
 | Filename score lower than expected            | §12 — request with `?debug=1` and inspect `_debug.filename` for naive/guessit/structured channel breakdown; verify guessit isn't mis-parsing the title                                                                                                                                        |
 | 503 Service Unavailable                       | §14 — featurization isn't `ready`. `GET /api/featurization/status` for fleet view; `GET /api/extraction/{job_id}/features` for one job. Expected during cold start, cascade, never-seen-job; abnormal if stuck.                                                                              |
 | Bridge unresponsive (`/health` times out)     | §14.4 — CPU-bound compute leaked onto the event loop. Profile and confirm `asyncio.to_thread` wraps the affected callsite. The regression test in `test_lifecycle.py` should catch this in CI; if it didn't, the test fixture isn't representative.                                            |

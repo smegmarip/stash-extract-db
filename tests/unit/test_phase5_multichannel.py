@@ -5,15 +5,16 @@ Covers:
     histogram-intersection between scene + record aggregates
   - score_image_channel_c is frame-level (same shape as A)
   - score_image_composite combines all three with max + bonus
-  - 400 when image_min_contribution / image_bonus_per_extra missing while
-    image_channels has more than just 'phash'
   - image_channels=["phash"] alone falls through to the Phase 4 path
+
+Per CLAUDE.md §1, scoring config is bridge-owned and missing fields
+fall back to settings defaults — the previous "400 on missing field"
+test was removed in the config-ownership inversion.
 """
 import json
 from typing import Optional
 
 import pytest
-from fastapi import HTTPException
 
 from bridge.app.extractor import client as ex_client
 from bridge.app.stash import client as stash_client
@@ -197,32 +198,9 @@ class TestComposite:
         assert composites[1] > composites[2]
 
 
-# --- Multi-channel validation --------------------------------------------
+# --- Multi-channel single-channel pass-through ---------------------------
 
 class TestMultiChannelValidation:
-    async def test_400_when_min_contribution_missing(
-        self, bridge_db, clean_settings, mock_clients, reset_worker,
-    ):
-        from bridge.app.matching.scrape import scrape as do_scrape
-
-        clean_settings.bridge_new_scoring_enabled = True
-        records = [{"data": {"id": "r0", "cover_image": "imgA", "images": []}}]
-        await _seed_and_featurize(
-            bridge_db, reset_worker, clean_settings, mock_clients,
-            "j_v", records, {"imgA": 1},
-        )
-
-        with pytest.raises(HTTPException) as exc_info:
-            await do_scrape(
-                _scene(), _candidates(records, "j_v"),
-                False, "cover", 0.05, "phash", 8, 8,
-                image_gamma=2.0, image_count_k=2.0,
-                image_channels=["phash", "color_hist", "tone"],
-                image_min_contribution=None,  # missing!
-                image_bonus_per_extra=0.1,
-            )
-        assert exc_info.value.status_code == 400
-
     async def test_single_channel_phash_only_skips_validation(
         self, bridge_db, clean_settings, mock_clients, reset_worker, synth_image,
     ):

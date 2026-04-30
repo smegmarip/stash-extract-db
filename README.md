@@ -82,10 +82,10 @@ All `/match/*` endpoints accept `?debug=1` in search mode for a per-candidate br
 
 ## Configuration
 
-All matching parameters originate in the scraper's `config.py` per CLAUDE.md §1 — the bridge has no fallbacks for these. Bridge env vars are for infrastructure and the featurization lifecycle. Both layers are documented in:
+All matching configuration lives on the bridge per CLAUDE.md §1. The scraper is a metadata transport — its `config.py` has only `BRIDGE_URL` and `REQUEST_TIMEOUT_S`. Bridge configuration:
 
-- [`stash-extract-scraper/config.py`](stash-extract-scraper/config.py) — the scraper-side config (matching parameters with calibrated defaults).
-- [`.env.example`](.env.example) — bridge-side env (URLs, auth, lifecycle toggles, eviction budget).
+- [`.env.example`](.env.example) — operational env (connection, auth, lifecycle toggles, concurrency, storage budgets).
+- [`bridge/app/settings.py`](bridge/app/settings.py) — calibrated scoring values (internal service behavior).
 
 Defaults are calibrated against a 491-video Pexels corpus (precision@1 = 96.2%); see [`docs/calibration/CALIBRATION_RESULTS.md`](docs/calibration/CALIBRATION_RESULTS.md) for provenance.
 
@@ -95,7 +95,7 @@ Defaults are calibrated against a 491-video Pexels corpus (precision@1 = 96.2%);
 
 The new scoring formula and featurization lifecycle are independently togglable:
 
-- `BRIDGE_NEW_SCORING_ENABLED=false` → reverts image scoring to the legacy top-K-mean. Reset `IMAGE_THRESHOLD` to ~0.7 in `config.py`.
+- `BRIDGE_NEW_SCORING_ENABLED=false` → reverts image scoring to the legacy top-K-mean.
 - `BRIDGE_LIFECYCLE_ENABLED=false` → reverts to on-demand caching against the legacy `image_hashes` table. No 503s, no corpus-relative weighting.
 - `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=false` → stops dual-writing pHash to `image_hashes`. After a stable period, you can `DROP TABLE image_hashes` manually.
 

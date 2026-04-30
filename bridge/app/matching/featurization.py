@@ -80,8 +80,8 @@ async def _featurize_inner(job_id: str) -> None:
         logger.info("featurize: no image refs for job=%s — marking ready empty", job_id)
         return
 
-    algorithm = settings.bridge_featurize_algorithm
-    hash_size = settings.bridge_featurize_hash_size
+    algorithm = settings.bridge_hash_algorithm
+    hash_size = settings.bridge_hash_size
     new_algo_a = _algo_key(algorithm, hash_size)
 
     refs = list(ref_to_records.keys())
