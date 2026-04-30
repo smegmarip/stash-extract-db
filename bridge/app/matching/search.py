@@ -84,6 +84,7 @@ async def search(
     image_channels: Optional[list[str]] = None,
     image_min_contribution: Optional[float] = None,
     image_bonus_per_extra: Optional[float] = None,
+    image_search_floor: Optional[float] = None,
 ) -> list[tuple[dict[str, Any], float, Optional[dict[str, Any]]]]:
     """Returns list of (candidate, score, debug_or_None)."""
 
@@ -142,6 +143,20 @@ async def search(
             )
             image_contrib = aggregate_search(sims, n_images)
             image_dbg_extra = {"sims": sims, "n_extractor_images": n_images}
+
+        # Search-mode confidence floor: drop weak image-only candidates
+        # before they pollute the result set. Definitive signals
+        # (Studio+Code, Exact Title) bypass the floor — they have their
+        # own correctness contracts and shouldn't be gated on a weak image.
+        # See CALIBRATION_RESULTS.md Run 5 / architectural changes.
+        if (
+            image_search_floor is not None
+            and image_contrib < image_search_floor
+            and not sc_fires
+            and not et_fires
+        ):
+            continue
+
         score += image_contrib
 
         if debug:

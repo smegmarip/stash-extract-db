@@ -67,3 +67,9 @@ IMAGE_MIN_CONTRIBUTION = 0.3
 # `max(fired) + bonus * (n_fired - 1)`, capped at 1.0). Tune higher to
 # reward broad agreement, lower to make the strongest channel dominate.
 IMAGE_BONUS_PER_EXTRA = 0.1
+
+# Search-mode confidence floor on the image composite. When set,
+# candidates whose image composite is below this AND have no definitive
+# signal (Studio+Code or Exact Title) are dropped from search results.
+# Scrape mode is unaffected — it has its own `IMAGE_THRESHOLD` gate.
+IMAGE_SEARCH_FLOOR = None

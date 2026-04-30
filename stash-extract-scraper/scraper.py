@@ -53,6 +53,7 @@ def _common_params() -> dict:
         "image_channels": getattr(config, "IMAGE_CHANNELS", ["phash", "color_hist", "tone"]),
         "image_min_contribution": getattr(config, "IMAGE_MIN_CONTRIBUTION", 0.3),
         "image_bonus_per_extra": getattr(config, "IMAGE_BONUS_PER_EXTRA", 0.1),
+        "image_search_floor": getattr(config, "IMAGE_SEARCH_FLOOR", None),
     }
 
 

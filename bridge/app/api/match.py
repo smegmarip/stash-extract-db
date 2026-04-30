@@ -340,6 +340,7 @@ async def _match_with_scene(
         image_channels=req.image_channels,
         image_min_contribution=req.image_min_contribution,
         image_bonus_per_extra=req.image_bonus_per_extra,
+        image_search_floor=req.image_search_floor,
     )
     out: list[dict[str, Any]] = []
     for cand, score, dbg in ranked:

@@ -162,9 +162,13 @@ async def _featurize_inner(job_id: str) -> None:
 
     # Phase 3: uniqueness for A and C (B is aggregate-only and the formula
     # for aggregate channels — `S_B = m_B' * q_B` — does not consume c_i).
+    # Per-channel threshold/alpha resolution lets tone use a stricter
+    # near-duplicate threshold than pHash (architectural fix Run 7).
     await cdb.set_feature_progress(job_id, 0.92)
-    threshold = settings.bridge_featurize_uniqueness_threshold
-    alpha = settings.bridge_featurize_uniqueness_alpha
+    phash_threshold = settings.channel_uniqueness_threshold("phash")
+    phash_alpha = settings.channel_uniqueness_alpha("phash")
+    tone_threshold = settings.channel_uniqueness_threshold("tone")
+    tone_alpha = settings.channel_uniqueness_alpha("tone")
 
     # Compute all phash uniqueness values in one thread call (N×N inner
     # loop), then await sequential DB writes back on the loop.
@@ -174,7 +178,7 @@ async def _featurize_inner(job_id: str) -> None:
         for ref in keys:
             out[ref] = _compute_uniqueness_phash(
                 ref, keys, ref_to_records, ref_hash_a, hash_size,
-                threshold, alpha,
+                phash_threshold, phash_alpha,
             )
         return out
 
@@ -190,7 +194,7 @@ async def _featurize_inner(job_id: str) -> None:
         for ref in keys:
             out[ref] = _compute_uniqueness_tone(
                 ref, keys, ref_to_records, ref_blob_c,
-                threshold, alpha,
+                tone_threshold, tone_alpha,
             )
         return out
 

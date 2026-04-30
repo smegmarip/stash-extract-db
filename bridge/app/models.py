@@ -32,6 +32,15 @@ class MatchRequest(BaseModel):
     image_min_contribution: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     image_bonus_per_extra: Optional[float] = Field(default=None, ge=0.0, le=1.0)
 
+    # Phase 6 search-mode confidence floor. Drops candidates whose image
+    # composite is below the floor *unless* a definitive signal (Studio+Code
+    # or Exact Title) fired. Scrape mode is unaffected — it has its own
+    # `threshold` gate at the composite level. None = no floor (legacy
+    # behavior). See CALIBRATION_RESULTS.md Run 5 for why this is needed:
+    # weak matches at composite ~0.11–0.13 leak into search results for
+    # scenes with no real extractor counterpart.
+    image_search_floor: Optional[float] = Field(default=None, ge=0.0, le=1.0)
+
 
 class FragmentMatchRequest(MatchRequest):
     scene_id: str

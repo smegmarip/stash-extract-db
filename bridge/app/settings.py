@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pydantic_settings import BaseSettings
 
 
@@ -28,9 +30,39 @@ class Settings(BaseSettings):
     bridge_featurize_algorithm: str = "phash"
     bridge_featurize_hash_size: int = 8
     # c_i smoothing per §4.6 — used in featurization until Phase 4 hands
-    # this off to the scraper config.
+    # this off to the scraper config. The "global" values below are the
+    # historical single setting; per-channel overrides (added in
+    # architectural fix Run 7) take precedence when set.
     bridge_featurize_uniqueness_alpha: float = 1.0
     bridge_featurize_uniqueness_threshold: float = 0.85
+    # Per-channel overrides. None = inherit the global value. Mechanism
+    # exists for users whose corpus benefits from per-channel tuning;
+    # defaults all None because empirical calibration on the Pexels
+    # corpus (CALIBRATION_RESULTS.md Run 7) showed the global 0.85 / 1.0
+    # is correct for both pHash and tone — counterintuitively, tone's
+    # global threshold of 0.85 effectively silences a noisy channel via
+    # c_i collapse, which is the desired behavior on that corpus. A
+    # corpus where tone is a stronger discriminator (e.g., monochrome
+    # film, surveillance footage) might benefit from a stricter tone
+    # threshold; that's now reachable without code changes.
+    bridge_featurize_uniqueness_threshold_phash: Optional[float] = None
+    bridge_featurize_uniqueness_threshold_tone: Optional[float] = None
+    bridge_featurize_uniqueness_alpha_phash: Optional[float] = None
+    bridge_featurize_uniqueness_alpha_tone: Optional[float] = None
+
+    def channel_uniqueness_threshold(self, channel: str) -> float:
+        per = {
+            "phash": self.bridge_featurize_uniqueness_threshold_phash,
+            "tone":  self.bridge_featurize_uniqueness_threshold_tone,
+        }.get(channel)
+        return per if per is not None else self.bridge_featurize_uniqueness_threshold
+
+    def channel_uniqueness_alpha(self, channel: str) -> float:
+        per = {
+            "phash": self.bridge_featurize_uniqueness_alpha_phash,
+            "tone":  self.bridge_featurize_uniqueness_alpha_tone,
+        }.get(channel)
+        return per if per is not None else self.bridge_featurize_uniqueness_alpha
     # Per-job parallel asset fetches inside featurize_task (§4.4).
     bridge_featurize_per_job_concurrency: int = 8
 
