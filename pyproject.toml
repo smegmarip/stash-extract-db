@@ -17,5 +17,22 @@ dependencies = [
     "guessit>=3.8",
 ]
 
+[project.optional-dependencies]
+test = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+]
+
 [tool.setuptools.packages.find]
 where = ["bridge"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit", "tests/integration"]
+asyncio_mode = "auto"
+markers = [
+    "live: tests that hit a running bridge + Stash; auto-skip if unreachable",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:imagehash",
+    "ignore::DeprecationWarning:pydantic",
+]
