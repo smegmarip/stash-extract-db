@@ -40,28 +40,39 @@ REQUEST_TIMEOUT_S = 90
 # See MULTI_CHANNEL_SCORING.md §3 for the formulas these tune.
 
 # Sharpening exponent: higher → stronger suppression of noise-floor
-# similarities. 2 is the calibrated default; raise to 3 for stricter
-# false-positive rejection if your corpus has many spurious near-matches.
-IMAGE_GAMMA = 2.0
+# similarities. 3.5 is the calibrated peak on a diverse 491-video Pexels
+# corpus (CALIBRATION_RESULTS.md Run 3a). Lower (2.0) keeps weak signals;
+# higher (4.0+) plateaus then drifts as legitimate marginal sims also
+# get suppressed.
+IMAGE_GAMMA = 3.5
 
-# Count-saturation k: lower → records with few images are penalized more
-# heavily relative to records with many. 2.0 is calibrated for typical
-# extractor records (≤5 images each).
-IMAGE_COUNT_K = 2.0
+# Count-saturation k: count_conf = 1 - exp(-Σw / k). Lower → sparse-N
+# records (a single perfect match) compete more equally with broad-shallow
+# records (many mediocre matches). 0.25 is the calibrated peak; the prior
+# default of 2.0 was biased against records with 1-2 strong images.
+# (CALIBRATION_RESULTS.md Run 3c.)
+IMAGE_COUNT_K = 0.25
 
 # Uniqueness smoothing α: c_i = 1 / (1 + α * matches). Higher → reused
-# images (logos, title cards) get penalized more sharply.
+# images (logos, title cards) get penalized more sharply. 1.0 confirmed
+# at the empirical peak (CALIBRATION_RESULTS.md Run 5b).
 IMAGE_UNIQUENESS_ALPHA = 1.0
 
 # Channels to evaluate. Order doesn't matter for scoring (composition is
 # `max + bonus`). Drop a channel to disable it (e.g. ["phash"] to revert
-# to single-channel behavior with the new scoring formula).
+# to single-channel behavior with the new scoring formula). On
+# Pexels-style mixed-content corpora, channel C (tone) is effectively
+# silent because the global uniqueness threshold collapses tone c_i;
+# you can drop "tone" from this list for a ~33% per-query speedup with
+# no precision change. (CALIBRATION_RESULTS.md Run 7.)
 IMAGE_CHANNELS = ["phash", "color_hist", "tone"]
 
 # A channel "fires" if its S >= IMAGE_MIN_CONTRIBUTION; only firing
-# channels participate in cross-channel composition. Lower → more
-# channels qualify for the bonus; raise to gate out weak channels.
-IMAGE_MIN_CONTRIBUTION = 0.3
+# channels participate in cross-channel composition. 0.05 is the
+# calibrated peak — higher values exclude weak-but-correct contributions
+# from the bonus more aggressively than they exclude weak-but-incorrect
+# ones, so precision drops. (CALIBRATION_RESULTS.md Run 3b.)
+IMAGE_MIN_CONTRIBUTION = 0.05
 
 # Cross-channel bonus per extra firing channel (composition is
 # `max(fired) + bonus * (n_fired - 1)`, capped at 1.0). Tune higher to
@@ -72,4 +83,12 @@ IMAGE_BONUS_PER_EXTRA = 0.1
 # candidates whose image composite is below this AND have no definitive
 # signal (Studio+Code or Exact Title) are dropped from search results.
 # Scrape mode is unaffected — it has its own `IMAGE_THRESHOLD` gate.
+#
+# Default `None` (legacy behavior) — verified empirically on the Pexels
+# calibration corpus that any positive non-trivial value drops too many
+# weak-but-correct positive matches whose composite distribution
+# overlaps with weak-but-incorrect negative-control returns. See
+# `tests/calibration/CALIBRATION_RESULTS.md` Run 6 for the experiment.
+# Users with sharper corpus characteristics (clearer separation between
+# correct and incorrect composites) may benefit from a floor at 0.10–0.20.
 IMAGE_SEARCH_FLOOR = None
