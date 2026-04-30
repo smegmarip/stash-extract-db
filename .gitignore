@@ -7,6 +7,12 @@
 # Bridge runtime data (SQLite cache, fetched assets)
 data/
 
+# Calibration test artifacts (videos + thumbnails — large, regenerable)
+tests/calibration/dataset/
+tests/calibration/.video_cache/
+tests/calibration/runs/
+data-calib/
+
 # Python
 __pycache__/
 *.py[cod]
