@@ -205,6 +205,90 @@ class TestWorker:
         s = await bridge_db.get_feature_state("jq")
         assert s["state"] == "failed"   # untouched
 
+    async def test_startup_discovers_scene_shaped_jobs_on_cold_start(
+        self, bridge_db, clean_settings, mock_extractor, reset_worker, monkeypatch,
+    ):
+        """Cold-start regression: empty cache + reachable extractor must
+        eagerly featurize all scene-shaped jobs from the extractor —
+        not lazily on first /match. The previous implementation queried
+        only the local extractor_jobs table, which is empty on a fresh
+        deploy, so startup_recover did nothing and the eager-startup
+        contract degraded to lazy-on-first-request.
+        """
+        from bridge.app.extractor import client as ex_client
+
+        clean_settings.bridge_lifecycle_enabled = True
+
+        scene_schema = {
+            "id": "sch_scene",
+            "fields": [
+                {"name": n} for n in
+                ["title", "url", "cover_image", "images", "performers", "date", "details", "id"]
+            ],
+        }
+        non_scene_schema = {"id": "sch_other", "fields": [{"name": "title"}]}
+
+        async def _list():
+            return [
+                {"id": "j_scene", "status": "completed"},
+                {"id": "j_other", "status": "completed"},
+                {"id": "j_running", "status": "running"},
+            ]
+
+        async def _get_job(jid):
+            return {
+                "j_scene":   {"id": "j_scene", "name": "SceneSite", "completed_at": "2026-04-30T00:00:00",
+                              "extraction_config": {"schema_id": "sch_scene"}},
+                "j_other":   {"id": "j_other", "name": "OtherSite", "completed_at": "2026-04-30T00:00:00",
+                              "extraction_config": {"schema_id": "sch_other"}},
+                "j_running": {"id": "j_running", "name": "Running", "completed_at": "2026-04-30T00:00:00",
+                              "extraction_config": {"schema_id": "sch_scene"}},
+            }.get(jid)
+
+        async def _get_schema(sid):
+            return {"sch_scene": scene_schema, "sch_other": non_scene_schema}.get(sid)
+
+        async def _list_all_results(jid):
+            return []
+
+        monkeypatch.setattr(ex_client, "list_completed_jobs", _list)
+        monkeypatch.setattr(ex_client, "get_job", _get_job)
+        monkeypatch.setattr(ex_client, "get_schema", _get_schema)
+        monkeypatch.setattr(ex_client, "list_all_results", _list_all_results)
+
+        await reset_worker.startup_recover()
+
+        if "j_scene" in reset_worker._inflight:
+            await reset_worker._inflight["j_scene"]
+
+        s_scene = await bridge_db.get_feature_state("j_scene")
+        assert s_scene is not None and s_scene["state"] == "ready", (
+            "scene-shaped job should have been discovered, seeded, and featurized eagerly"
+        )
+        # Non-scene-shaped + non-completed jobs must NOT enter the worker.
+        assert await bridge_db.get_feature_state("j_other") is None
+        assert await bridge_db.get_feature_state("j_running") is None
+
+    async def test_startup_recover_tolerates_unreachable_extractor(
+        self, bridge_db, clean_settings, reset_worker, monkeypatch,
+    ):
+        """If the extractor is unreachable at boot, startup_recover must
+        log and continue rather than crashing the bridge. The lazy
+        fallback via _gate_features_ready still works for any later
+        request once the extractor returns.
+        """
+        from bridge.app.extractor import client as ex_client
+
+        clean_settings.bridge_lifecycle_enabled = True
+
+        async def _explode():
+            raise RuntimeError("extractor unreachable")
+
+        monkeypatch.setattr(ex_client, "list_completed_jobs", _explode)
+
+        # Should not raise.
+        await reset_worker.startup_recover()
+
 
 # --- Cascade re-enqueue --------------------------------------------------
 

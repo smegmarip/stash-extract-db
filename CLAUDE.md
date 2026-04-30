@@ -395,10 +395,11 @@ Stash-side rows (`source IN ('stash_cover', 'stash_sprite', 'stash_aggregate')`)
 
 On bridge container startup, after `init_db()`:
 
-1. Reset stale `featurizing` rows interrupted by the previous shutdown: `UPDATE job_feature_state SET state='featurizing', progress=0, started_at=now(), error=NULL WHERE state='featurizing' AND started_at < now() - STALE_TASK_MS`.
-2. Discover all jobs that are not yet `ready`: `SELECT j.job_id FROM extractor_jobs j LEFT JOIN job_feature_state f USING (job_id) WHERE f.state IS NULL OR f.state != 'ready'`.
-3. Insert/update them as queued (`state='featurizing'`, `progress=0`).
-4. Enqueue all of them for the worker pool (bounded by concurrency limit).
+1. **Discover** the extractor's current jobs: `GET /api/jobs?status=completed`, then `GET /api/jobs/{id}` for each, then `GET /api/schemas/{schema_id}` to filter by §6 scene-shape. Seed the local `extractor_jobs` row for each scene-shaped job via `inv.ensure_job_results_fresh(job)`. **This step is mandatory** — a cold-start cache has no `extractor_jobs` rows, so the recovery scan in step 3 would otherwise find nothing and degrade the eager-startup contract to lazy-on-first-request. Tolerate extractor-unreachable: log + continue, the lazy fallback in `_gate_features_ready` still works.
+2. Reset stale `featurizing` rows interrupted by the previous shutdown: `UPDATE job_feature_state SET state='featurizing', progress=0, started_at=now(), error=NULL WHERE state='featurizing' AND started_at < now() - STALE_TASK_MS`.
+3. Discover all jobs that are not yet `ready`: `SELECT j.job_id FROM extractor_jobs j LEFT JOIN job_feature_state f USING (job_id) WHERE f.state IS NULL OR f.state != 'ready'`.
+4. Insert/update them as queued (`state='featurizing'`, `progress=0`).
+5. Enqueue all of them for the worker pool (bounded by concurrency limit).
 
 The bridge starts accepting requests immediately; un-ready jobs return 503 until their task completes. This is **idempotent** — re-running yields the same state. **Phase 1 of `featurize_task` writes per-image features to `image_features` as it goes**, so on interrupt + restart, the next task run reads what's already cached and only fetches missing refs. No work lost.
 

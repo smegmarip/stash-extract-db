@@ -70,17 +70,88 @@ async def _run(job_id: str) -> None:
         await featurize_job(job_id)
 
 
-async def startup_recover() -> None:
-    """Boot-time scan per §4.10. Idempotent — safe to call multiple times.
+async def discover_jobs_from_extractor() -> int:
+    """Pull the extractor's completed-jobs list and seed local
+    `extractor_jobs` rows for each scene-shaped job.
 
-    Steps:
-      1. Reset stale 'featurizing' rows interrupted by previous shutdown.
-      2. Find all extractor_jobs that are not 'ready'.
-      3. Enqueue each.
+    Without this step, a cold-start bridge with an empty SQLite cache has
+    no `extractor_jobs` rows for `startup_recover` to act on — the eager-
+    featurization contract (CLAUDE.md §14.6) would degrade to lazy-on-
+    first-request, which is exactly what the lifecycle is supposed to
+    prevent.
+
+    Returns the count of seeded scene-shaped jobs. Logs and returns 0 on
+    extractor-side failure rather than crashing boot — the lazy fallback
+    via `_gate_features_ready` still works.
+    """
+    from ..extractor import client as ex_client
+    from ..extractor.schema_match import is_scene_shaped
+    from ..cache import invalidation as inv
+
+    try:
+        summaries = await ex_client.list_completed_jobs()
+    except Exception as e:
+        logger.warning("startup_discover: list_completed_jobs failed :: %s", e)
+        return 0
+
+    completed = [j for j in summaries if (j.get("status") or "") == "completed"]
+    if not completed:
+        return 0
+
+    full_jobs: list[dict] = []
+    for s in completed:
+        try:
+            full = await ex_client.get_job(s["id"])
+        except Exception as e:
+            logger.warning("startup_discover: get_job(%s) failed :: %s", s.get("id"), e)
+            continue
+        if full:
+            full_jobs.append(full)
+
+    schema_ids = {(j.get("extraction_config") or {}).get("schema_id") for j in full_jobs}
+    schemas: dict[str, dict] = {}
+    for sid in schema_ids:
+        if not sid:
+            continue
+        try:
+            sch = await ex_client.get_schema(sid)
+            if sch:
+                schemas[sid] = sch
+        except Exception as e:
+            logger.warning("startup_discover: get_schema(%s) failed :: %s", sid, e)
+
+    seeded = 0
+    for j in full_jobs:
+        sid = (j.get("extraction_config") or {}).get("schema_id")
+        sch = schemas.get(sid or "")
+        if not (sch and is_scene_shaped(sch)):
+            continue
+        try:
+            await inv.ensure_job_results_fresh(j)
+            seeded += 1
+        except Exception as e:
+            logger.warning("startup_discover: ensure_job_results_fresh(%s) failed :: %s", j.get("id"), e)
+    return seeded
+
+
+async def startup_recover() -> None:
+    """Boot-time scan. Idempotent — safe to call multiple times.
+
+    Steps (CLAUDE.md §14.6):
+      1. Discover the extractor's current jobs and seed local rows for
+         scene-shaped ones. Without this, a cold-start cache has no
+         job rows for the recovery scan to act on.
+      2. Reset stale 'featurizing' rows interrupted by previous shutdown.
+      3. Find all extractor_jobs that are not 'ready'.
+      4. Enqueue each.
     """
     if not settings.bridge_lifecycle_enabled:
         logger.info("startup_recover: BRIDGE_LIFECYCLE_ENABLED=false; skipping")
         return
+
+    seeded = await discover_jobs_from_extractor()
+    if seeded:
+        logger.info("startup_recover: seeded %d scene-shaped jobs from extractor", seeded)
 
     cutoff = (datetime.utcnow() - timedelta(milliseconds=settings.bridge_stale_task_ms)).isoformat()
     reset = await cdb.reset_stale_featurizing(cutoff)
