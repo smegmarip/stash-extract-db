@@ -308,7 +308,7 @@ def _resolve_match_params(req) -> dict[str, Any]:
         "sprite_sample_size":     req.sprite_sample_size     if req.sprite_sample_size     is not None else settings.bridge_sprite_sample_size,
         "image_gamma":            req.image_gamma            if req.image_gamma            is not None else settings.bridge_image_gamma,
         "image_count_k":          req.image_count_k          if req.image_count_k          is not None else settings.bridge_image_count_k,
-        "image_channels":         req.image_channels         or settings.bridge_image_channels,
+        "image_channels":         req.image_channels         or settings.image_channels,
         "image_min_contribution": req.image_min_contribution if req.image_min_contribution is not None else settings.bridge_image_min_contribution,
         "image_bonus_per_extra":  req.image_bonus_per_extra  if req.image_bonus_per_extra  is not None else settings.bridge_image_bonus_per_extra,
         # search_floor: None is a meaningful "disabled" value, so request

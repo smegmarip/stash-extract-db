@@ -26,16 +26,16 @@ class Settings(BaseSettings):
     bridge_image_count_k: float = 0.25          # Run 3c peak
     bridge_image_min_contribution: float = 0.05 # Run 3b peak
     bridge_image_bonus_per_extra: float = 0.1
-    bridge_image_channels: list[str] = ["phash", "color_hist", "tone"]
+    # Stored as a comma-separated string to sidestep pydantic-settings'
+    # built-in JSON decoding for list[str] env vars (which would reject
+    # `phash,color_hist,tone` and require `["phash","color_hist","tone"]`).
+    # Use `image_channels` (the property below) to consume.
+    bridge_image_channels: str = "phash,color_hist,tone"
     bridge_image_search_floor: Optional[float] = None  # mechanism shipped, default off (Run 6)
 
-    @field_validator("bridge_image_channels", mode="before")
-    @classmethod
-    def _parse_channels(cls, v):
-        """Accept comma-separated string from env, list[str] from defaults."""
-        if isinstance(v, str):
-            return [c.strip() for c in v.split(",") if c.strip()]
-        return v
+    @property
+    def image_channels(self) -> list[str]:
+        return [c.strip() for c in self.bridge_image_channels.split(",") if c.strip()]
 
     @field_validator(
         "bridge_image_search_floor",
