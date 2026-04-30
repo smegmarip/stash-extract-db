@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # image_hashes (Phase 2 dual-write still active) — used as the rollback
     # path for Phase 3+. When true, /match endpoints gate on job_feature_state
     # and return 503 + Retry-After until a job's features are 'ready'.
-    bridge_lifecycle_enabled: bool = False
+    bridge_lifecycle_enabled: bool = True
     bridge_featurize_concurrency: int = 4
     # Stale-task timeout: a 'featurizing' row whose started_at is older than
     # this gets reset on startup. 10 minutes is generous for typical jobs.
@@ -28,7 +28,11 @@ class Settings(BaseSettings):
     # via Phase 2 dual-write, but may use a different algorithm). Phase 4
     # unifies these so featurization is request-driven.
     bridge_featurize_algorithm: str = "phash"
-    bridge_featurize_hash_size: int = 8
+    # Aligned with the scraper's HASH_SIZE default (config.py). If the
+    # bridge featurizes at a different size than the scraper sends in
+    # match requests, image_features rows can't be reused and the
+    # request falls through to on-demand compute.
+    bridge_featurize_hash_size: int = 16
     # c_i smoothing per §4.6 — used in featurization until Phase 4 hands
     # this off to the scraper config. The "global" values below are the
     # historical single setting; per-channel overrides (added in
@@ -70,7 +74,7 @@ class Settings(BaseSettings):
     # legacy top-K-mean (§3.2 prior). When true, requests must include
     # image_gamma, image_count_k, image_uniqueness_alpha or the bridge
     # returns 400.
-    bridge_new_scoring_enabled: bool = False
+    bridge_new_scoring_enabled: bool = True
 
     # Phase 6 LRU eviction for Stash-side image_features rows. The
     # extractor side is bounded by job count and cleared on cascade, so

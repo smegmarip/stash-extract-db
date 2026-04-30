@@ -30,7 +30,7 @@ pip install -r ~/.stash/scrapers/stash-extract-scraper/requirements.txt
 # Stash → Settings → Scrapers → Reload Scrapers
 ```
 
-For featurization (recommended): set `BRIDGE_LIFECYCLE_ENABLED=true` and `BRIDGE_NEW_SCORING_ENABLED=true` in `.env`. See [`docs/HOW_TO_USE.md`](docs/HOW_TO_USE.md) for the full runbook.
+The shipped `.env.example` enables the multi-channel pipeline by default with calibrated tuning values. See [`docs/HOW_TO_USE.md`](docs/HOW_TO_USE.md) for the full runbook and §9 for every environment variable.
 
 ---
 

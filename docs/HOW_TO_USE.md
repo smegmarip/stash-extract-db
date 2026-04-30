@@ -39,16 +39,9 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-Minimum required variables:
+The shipped `.env.example` enables the multi-channel pipeline by default and uses the calibrated tuning values. For most users, the only variables that need editing are connection-side: `STASH_URL`, optionally `STASH_API_KEY` or `STASH_SESSION_COOKIE`, and `EXTRACTOR_URL` if you've moved the extractor off its default Docker network.
 
-| Variable                                    | Notes                                                                                                                                                     |
-| ------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `STASH_URL`                                 | Where Stash is reachable from inside the bridge container. On Docker Desktop, `http://host.docker.internal:9999` is the default and works out of the box. |
-| `STASH_API_KEY` _or_ `STASH_SESSION_COOKIE` | Whichever your Stash auth uses. Leave blank if Stash is on localhost without auth.                                                                        |
-| `EXTRACTOR_URL`                             | Defaults to `http://extractor-gateway:12000` — works if both containers share `extractor_network`.                                                        |
-| `DATA_PATH`                                 | Host directory mounted at `/data` in the container. Holds the SQLite cache. Default `./data` (created automatically).                                     |
-
-Set `BRIDGE_LIFECYCLE_ENABLED=true` and `BRIDGE_NEW_SCORING_ENABLED=true` to use the multi-channel scoring path described in [`CLAUDE.md`](../CLAUDE.md) §13–§14. Leave them `false` (default in `.env.example`) to run the legacy single-channel pHash path — useful as a rollback (§7).
+Full reference for every environment variable lives in **§9 Environment variable reference** at the end of this document.
 
 ### 2.3 Bring up the bridge
 
@@ -456,3 +449,73 @@ For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the sym
 | Scoring same scene differently after restart  | `corpus_stats` regenerated — baseline shifts slightly. Expected; absolute scores not stable across re-featurization, but ranks should be. |
 | Bridge unresponsive (`/health` timing out) during heavy work | Possible regression of the asyncio.to_thread fix — see CLAUDE.md §14.4. Run `pytest tests/unit/test_lifecycle.py::TestEventLoopResponsiveness`. |
 | Need to nuke everything and start fresh      | `docker compose down -v` won't delete `./data/`. Do `rm -rf ./data && docker compose up -d --build`.                                       |
+
+---
+
+## 9. Environment variable reference
+
+Every environment variable consumed by the bridge container or `docker-compose.yml`. Compose-only vars (rows marked **compose**) are read by `docker-compose.yml` itself for port mapping / volume bind / network selection — they don't make it into the bridge process. All other vars are read by the bridge process via `bridge/app/settings.py`.
+
+Per [`CLAUDE.md`](../CLAUDE.md) §1, scraper-side matching parameters (`IMAGE_GAMMA`, `IMAGE_THRESHOLD`, etc.) are **not** environment variables — they live in `stash-extract-scraper/config.py` and are sent in every request. The bridge has no fallback for these. See §3 for the scraper config table.
+
+| Variable                                       | Default                              | Purpose                                                                                                                                       |
+| ---------------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BRIDGE_PORT` *(compose)*                      | `13000`                              | Host port that maps to the bridge container's 13000.                                                                                          |
+| `DATA_PATH` *(compose)*                        | `./data`                             | Host directory bind-mounted at `/data` in the container. Holds the SQLite cache.                                                              |
+| `DOCKER_NETWORK` *(compose)*                   | `extractor_network`                  | External Docker network name. Bridge attaches to it to talk to the extractor.                                                                 |
+| `STASH_URL`                                    | `http://host.docker.internal:9999`   | Where Stash is reachable from inside the bridge container.                                                                                    |
+| `STASH_API_KEY`                                | *(empty)*                            | Stash API key, if auth is enabled. Use this OR session cookie, not both.                                                                      |
+| `STASH_SESSION_COOKIE`                         | *(empty)*                            | Stash session cookie, alternative to API key.                                                                                                 |
+| `EXTRACTOR_URL`                                | `http://extractor-gateway:12000`     | Where the site-extractor is reachable. Defaults work when both containers share `extractor_network`.                                          |
+| `DATA_DIR`                                     | `/data`                              | Path inside the container where the SQLite cache lives. Don't change unless you also rewrite the bind mount.                                  |
+| `LOG_LEVEL`                                    | `INFO`                               | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                    |
+| `BRIDGE_LIFECYCLE_ENABLED`                     | `true`                               | Master toggle for eager featurization + 503 request gate. Set `false` only as a rollback to the legacy single-channel path (§7.2).            |
+| `BRIDGE_NEW_SCORING_ENABLED`                   | `true`                               | Master toggle for the multi-channel scoring formula. Set `false` to revert to the legacy top-K-mean (§7.1).                                   |
+| `BRIDGE_FEATURIZE_CONCURRENCY`                 | `4`                                  | Worker pool size — bounds parallel featurization across jobs. Lower if the extractor saturates.                                               |
+| `BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY`         | `8`                                  | Per-job parallel asset fetches. Lower if a single big job is too aggressive on the extractor.                                                 |
+| `BRIDGE_FEATURIZE_ALGORITHM`                   | `phash`                              | Hash algorithm for server-side featurization. **Must match the scraper's `HASH_ALGORITHM`** or featurized rows can't be reused.               |
+| `BRIDGE_FEATURIZE_HASH_SIZE`                   | `16`                                 | Hash size for server-side featurization. **Must match the scraper's `HASH_SIZE`** or featurized rows can't be reused.                         |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA`            | `1.0`                                | Smoothing factor in `c_i = 1 / (1 + α·matches)`. Calibrated peak (Run 5b).                                                                    |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD`        | `0.85`                               | Similarity threshold above which two record images count as a near-duplicate for `c_i`. Calibrated peak (Run 5a).                             |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH`  | *(unset → inherits global)*          | Per-channel override for pHash. Useful only if your corpus needs distinct tuning per channel; defaults validated optimal on Pexels (Run 7).   |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE`   | *(unset → inherits global)*          | Per-channel override for tone. Counterintuitively, lifting this above the global *hurts* on natural-scene corpora (Run 7).                    |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH`      | *(unset → inherits global)*          | Per-channel α override for pHash.                                                                                                             |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE`       | *(unset → inherits global)*          | Per-channel α override for tone.                                                                                                              |
+| `BRIDGE_STALE_TASK_MS`                         | `600000` (10 min)                    | A `featurizing` row whose `started_at` is older than this is treated as stuck on boot and re-enqueued.                                        |
+| `BRIDGE_STASH_FEATURE_BUDGET_BYTES`            | `1073741824` (1 GB)                  | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU. |
+| `BRIDGE_LRU_EVICTION_INTERVAL_S`               | `3600` (1 hour)                      | How often the LRU eviction loop runs.                                                                                                         |
+| `BRIDGE_LEGACY_DUAL_WRITE_ENABLED`             | `true`                               | While `true`, every pHash compute writes to both `image_hashes` (legacy) and `image_features`; reads check features first, fall back to legacy. Flip `false` to retire the legacy path (§7.3). |
+
+### 9.1 Where the calibrated values come from
+
+The defaults above marked "calibrated peak" were established by sweeps against a 491-video Pexels corpus. Run-by-run analysis lives in [`docs/calibration/CALIBRATION_RESULTS.md`](calibration/CALIBRATION_RESULTS.md). Bridge-side calibrated values:
+
+- `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA = 1.0` (Run 5b)
+- `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD = 0.85` (Run 5a)
+
+The scraper-side calibrated per-request values (`IMAGE_GAMMA = 3.5`, `IMAGE_COUNT_K = 0.25`, `IMAGE_MIN_CONTRIBUTION = 0.05`) are owned by `stash-extract-scraper/config.py` per CLAUDE.md §1 — they're sent in every request, never read from the bridge environment.
+
+### 9.2 Lifecycle vs. legacy mode
+
+When `BRIDGE_LIFECYCLE_ENABLED=true` (default):
+
+- The bridge eagerly discovers the extractor's job list at boot and featurizes everything (CLAUDE.md §14.6).
+- Match requests for not-yet-`ready` jobs return `503 + Retry-After`. Stash retries automatically.
+- All `BRIDGE_FEATURIZE_*` and `BRIDGE_STASH_FEATURE_*` settings are consulted.
+
+When `BRIDGE_LIFECYCLE_ENABLED=false`:
+
+- No eager discovery, no worker pool, no 503s. Hashes compute on-demand via the legacy `image_hashes` table.
+- All `BRIDGE_FEATURIZE_*` and `BRIDGE_STASH_FEATURE_*` settings are ignored.
+- Use case: emergency rollback if the lifecycle path misbehaves on your corpus.
+
+### 9.3 Mandatory alignment between bridge and scraper
+
+Three pairs of values must match between the bridge environment and the scraper config or featurized rows can't be reused (the matcher falls through to on-demand compute, defeating the lifecycle's purpose):
+
+| Bridge env                       | Scraper `config.py`  | Both default to |
+| -------------------------------- | -------------------- | --------------- |
+| `BRIDGE_FEATURIZE_ALGORITHM`     | `HASH_ALGORITHM`     | `phash`         |
+| `BRIDGE_FEATURIZE_HASH_SIZE`     | `HASH_SIZE`          | `16`            |
+
+If you change one, change the other and re-featurize (delete `job_feature_state` rows or restart with a fresh `data/`).
