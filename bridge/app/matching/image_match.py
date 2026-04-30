@@ -12,6 +12,7 @@ keyed by content fingerprint:
     completed_at — when that advances we drop the row block, so URL is stable
     within a snapshot).
 """
+import asyncio
 import logging
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
@@ -92,7 +93,10 @@ async def _hash_or_compute(
     if not data:
         return None
     try:
-        result = hash_image_bytes(data, algorithm, hash_size)
+        # Offload PIL/imagehash/numpy compute to a thread so the event
+        # loop stays responsive while the bridge is featurizing many
+        # images at once.
+        result = await asyncio.to_thread(hash_image_bytes, data, algorithm, hash_size)
     except Exception as e:
         logger.warning("hash failed source=%s ref=%s :: %s", source, ref_id, e)
         return None
@@ -168,7 +172,11 @@ async def stash_sprite_hashes(scene: dict[str, Any], algorithm: str, hash_size: 
         return []
 
     try:
-        results = hash_sprite_frames(sprite_bytes, vtt_text, sample_size, algorithm, hash_size)
+        # Sprite parsing + per-frame hashing are CPU-bound; run in a
+        # thread so the event loop stays responsive.
+        results = await asyncio.to_thread(
+            hash_sprite_frames, sprite_bytes, vtt_text, sample_size, algorithm, hash_size,
+        )
     except Exception as e:
         logger.warning("sprite hash failed for scene %s :: %s", scene.get("id"), e)
         return []
@@ -235,7 +243,8 @@ async def _features_or_compute_bc(
         return out
 
     if out["color_hist"] is None:
-        bres = color_hist_from_bytes(data)
+        # PIL decode + HSV histogram is CPU-bound — offload to thread.
+        bres = await asyncio.to_thread(color_hist_from_bytes, data)
         if bres is not None:
             blob, q = bres
             blob_bytes = bytes(blob)
@@ -244,7 +253,8 @@ async def _features_or_compute_bc(
             )
             out["color_hist"] = (blob_bytes, q)
     if out["tone"] is None:
-        cres = tone_from_bytes(data)
+        # Same: PIL decode + LANCZOS resize + entropy/variance is CPU-bound.
+        cres = await asyncio.to_thread(tone_from_bytes, data)
         if cres is not None:
             blob, q = cres
             blob_bytes = bytes(blob)
@@ -330,25 +340,35 @@ async def stash_sprite_bc_features(
     if not sprite_bytes or not vtt_text:
         return []
 
-    try:
+    def _decode_and_sample():
         from PIL import Image as PILImage
         import io as _io
         sprite_img = PILImage.open(_io.BytesIO(sprite_bytes))
         vtt_frames = parse_vtt(decode_vtt_text(vtt_text))
         if not vtt_frames:
-            return []
+            return None
         extracted = extract_sprite_frames(sprite_img, vtt_frames)
-        sampled = sample_frames(extracted, sample_size)
+        return sample_frames(extracted, sample_size)
+
+    try:
+        # Sprite decode + frame extraction is CPU/IO bound; off-loop.
+        sampled = await asyncio.to_thread(_decode_and_sample)
+        if sampled is None:
+            return []
     except Exception as e:
         logger.warning("sprite B/C decode failed for scene %s :: %s", scene.get("id"), e)
         return []
+
+    def _compute_frame(frame_image):
+        b_blob, b_q = compute_color_hist(frame_image)
+        c_blob, c_q = compute_tone(frame_image)
+        return b_blob, b_q, c_blob, c_q
 
     out = []
     for idx, frame in enumerate(sampled):
         ref_id = f"{scene['id']}:{idx}"
         try:
-            b_blob, b_q = compute_color_hist(frame["image"])
-            c_blob, c_q = compute_tone(frame["image"])
+            b_blob, b_q, c_blob, c_q = await asyncio.to_thread(_compute_frame, frame["image"])
         except Exception as e:
             logger.warning("sprite B/C compute failed scene=%s idx=%d :: %s", scene.get("id"), idx, e)
             out.append({"color_hist": None, "tone": None})

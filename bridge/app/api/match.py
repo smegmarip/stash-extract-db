@@ -99,6 +99,11 @@ async def _gate_features_ready(jobs: list[dict[str, Any]]) -> None:
     candidate set produces a 503 + Retry-After. Enqueue all non-ready jobs
     so the bridge starts working immediately.
 
+    Side effect: ensures each job has a local extractor_jobs row before
+    enqueuing. Without this, on a fresh DB the worker's `upsert_feature_state`
+    would FK-fail because no parent row exists yet. `ensure_job_results_fresh`
+    is idempotent + cheap on cache hits.
+
     No-op when BRIDGE_LIFECYCLE_ENABLED=false (rollback path).
     """
     if not settings.bridge_lifecycle_enabled:
@@ -106,6 +111,11 @@ async def _gate_features_ready(jobs: list[dict[str, Any]]) -> None:
     not_ready: list[tuple[str, Optional[float]]] = []
     for j in jobs:
         jid = j["id"]
+        try:
+            await inv.ensure_job_results_fresh(j)
+        except Exception as e:
+            logger.warning("could not refresh job %s before gate :: %s", jid, e)
+            continue
         state = await cdb.get_feature_state(jid)
         if state is None or state["state"] != "ready":
             not_ready.append((jid, (state or {}).get("progress")))

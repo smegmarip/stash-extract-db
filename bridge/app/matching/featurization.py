@@ -118,34 +118,44 @@ async def _featurize_inner(job_id: str) -> None:
     # Per-record B aggregate. Keyed by (job_id, record_idx) using the
     # extractor_aggregate source/ref convention from §2.1.
     await cdb.set_feature_progress(job_id, 0.82)
-    record_b_agg: dict[int, np.ndarray] = {}
-    for rec_idx, rec_refs in record_refs.items():
-        hists = [ref_blob_b[r] for r in rec_refs if r in ref_blob_b]
-        agg = aggregate_color_hist(hists)
-        if agg is None:
-            continue
-        record_b_agg[rec_idx] = agg
+
+    def _aggregate_per_record() -> dict[int, np.ndarray]:
+        """CPU-bound per-bin median + quality compute for every record."""
+        out: dict[int, np.ndarray] = {}
+        for rec_idx, rec_refs in record_refs.items():
+            hists = [ref_blob_b[r] for r in rec_refs if r in ref_blob_b]
+            agg = aggregate_color_hist(hists)
+            if agg is None:
+                continue
+            out[rec_idx] = agg
+        return out
+
+    record_b_agg = await asyncio.to_thread(_aggregate_per_record)
+
+    for rec_idx, agg in record_b_agg.items():
+        rec_refs = record_refs[rec_idx]
         agg_quality = _color_hist_quality(agg.astype(np.float64) / max(1.0, agg.sum()))
-        # Fingerprint = composite of constituent ref strings; stable for a
-        # given completed_at snapshot. Cascade re-featurize replaces the
-        # job's whole record set, which produces a new fingerprint.
         fingerprint = "|".join(sorted(rec_refs))
         await cdb.set_image_feature(
             "extractor_aggregate", f"{job_id}:{rec_idx}", fingerprint,
             "color_hist", CHANNEL_B_ALGO, bytes(agg), agg_quality,
         )
 
-    # Phase 2: empirical baselines per channel.
+    # Phase 2: empirical baselines per channel. Each compute is a tight
+    # numeric loop over up to 1000 sampled pairs — off-loop so the bridge
+    # stays responsive while featurization runs.
     await cdb.set_feature_progress(job_id, 0.85)
-    baseline_a = _compute_baseline_phash(
+    baseline_a = await asyncio.to_thread(
+        _compute_baseline_phash,
         list(ref_hash_a.keys()), ref_to_records, ref_hash_a, hash_size,
     )
     await cdb.set_corpus_stat(job_id, "phash", new_algo_a, baseline_a)
 
-    baseline_b = _compute_baseline_color_hist(record_b_agg)
+    baseline_b = await asyncio.to_thread(_compute_baseline_color_hist, record_b_agg)
     await cdb.set_corpus_stat(job_id, "color_hist", CHANNEL_B_ALGO, baseline_b)
 
-    baseline_c = _compute_baseline_tone(
+    baseline_c = await asyncio.to_thread(
+        _compute_baseline_tone,
         list(ref_blob_c.keys()), ref_to_records, ref_blob_c,
     )
     await cdb.set_corpus_stat(job_id, "tone", CHANNEL_C_ALGO, baseline_c)
@@ -156,19 +166,36 @@ async def _featurize_inner(job_id: str) -> None:
     threshold = settings.bridge_featurize_uniqueness_threshold
     alpha = settings.bridge_featurize_uniqueness_alpha
 
-    for ref in ref_hash_a:
-        c = _compute_uniqueness_phash(
-            ref, list(ref_hash_a.keys()), ref_to_records, ref_hash_a, hash_size,
-            threshold, alpha,
-        )
+    # Compute all phash uniqueness values in one thread call (N×N inner
+    # loop), then await sequential DB writes back on the loop.
+    def _all_uniqueness_phash() -> dict[str, float]:
+        out: dict[str, float] = {}
+        keys = list(ref_hash_a.keys())
+        for ref in keys:
+            out[ref] = _compute_uniqueness_phash(
+                ref, keys, ref_to_records, ref_hash_a, hash_size,
+                threshold, alpha,
+            )
+        return out
+
+    phash_uniq = await asyncio.to_thread(_all_uniqueness_phash)
+    for ref, c in phash_uniq.items():
         await cdb.set_image_uniqueness(job_id, ref, "phash", c)
 
     await cdb.set_feature_progress(job_id, 0.97)
-    for ref in ref_blob_c:
-        c = _compute_uniqueness_tone(
-            ref, list(ref_blob_c.keys()), ref_to_records, ref_blob_c,
-            threshold, alpha,
-        )
+
+    def _all_uniqueness_tone() -> dict[str, float]:
+        out: dict[str, float] = {}
+        keys = list(ref_blob_c.keys())
+        for ref in keys:
+            out[ref] = _compute_uniqueness_tone(
+                ref, keys, ref_to_records, ref_blob_c,
+                threshold, alpha,
+            )
+        return out
+
+    tone_uniq = await asyncio.to_thread(_all_uniqueness_tone)
+    for ref, c in tone_uniq.items():
         await cdb.set_image_uniqueness(job_id, ref, "tone", c)
 
 
