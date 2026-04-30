@@ -39,9 +39,9 @@ cp .env.example .env
 $EDITOR .env
 ```
 
-The shipped `.env.example` enables the multi-channel pipeline by default. For most users, the only variables that need editing are connection-side: `STASH_URL`, optionally `STASH_API_KEY` or `STASH_SESSION_COOKIE`, and `EXTRACTOR_URL` if you've moved the extractor off its default Docker network.
+The shipped `.env.example` enables the multi-channel pipeline by default with calibrated values from a 491-video Pexels corpus sweep (see [`calibration/CALIBRATION_RESULTS.md`](calibration/CALIBRATION_RESULTS.md)). For most users, the only variables that need editing are connection-side: `STASH_URL`, optionally `STASH_API_KEY` or `STASH_SESSION_COOKIE`, and `EXTRACTOR_URL` if you've moved the extractor off its default Docker network.
 
-Match-time scoring parameters (γ, k, threshold, etc.) are calibrated bridge behavior — they live inside the service in `bridge/app/settings.py` and are not exposed as user-facing knobs. See §9 for the operational env var reference.
+The calibrated scoring values (γ, k, threshold, hash size, etc.) are also in `.env`, grouped separately under "calibrated scoring values" — re-calibration against a different corpus = re-run the sweep harness and update these values. See §9 for the full reference.
 
 ### 2.3 Bring up the bridge
 
@@ -365,7 +365,9 @@ For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the sym
 
 ## 9. Environment variable reference
 
-Operational env vars only. The bridge ships with calibrated scoring values inside the service (`bridge/app/settings.py`) — those are not user-facing knobs and not in this table.
+Every environment variable consumed by the bridge or `docker-compose.yml`, in two groups: **operational** (depends on hardware / deployment, edit per-deploy) and **calibrated** (depends on corpus characteristics, do not edit without empirical evidence). Both live in the same `.env` file — re-calibration *is* configuration; treating them differently was the mistake the earlier design made.
+
+### 9.1 Operational — deployment-time
 
 | Variable                                  | Default                              | Purpose                                                                                                                                       |
 | ----------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -383,14 +385,35 @@ Operational env vars only. The bridge ships with calibrated scoring values insid
 | `BRIDGE_FEATURIZE_CONCURRENCY`            | `4`                                  | Worker pool size — bounds parallel featurization across jobs. Lower if the extractor saturates.                                               |
 | `BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY`    | `8`                                  | Per-job parallel asset fetches. Lower if a single big job is too aggressive on the extractor.                                                 |
 | `BRIDGE_STALE_TASK_MS`                    | `600000` (10 min)                    | A `featurizing` row whose `started_at` is older than this is treated as stuck on boot and re-enqueued.                                        |
-| `BRIDGE_STASH_FEATURE_BUDGET_BYTES`       | `1073741824` (1 GB)                  | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU. |
+| `BRIDGE_STASH_FEATURE_BUDGET_BYTES`       | `1073741824` (1 GB)                  | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU.  |
 | `BRIDGE_LRU_EVICTION_INTERVAL_S`          | `3600` (1 hour)                      | How often the LRU eviction loop runs.                                                                                                         |
 | `BRIDGE_LEGACY_DUAL_WRITE_ENABLED`        | `true`                               | While `true`, every pHash compute writes to both `image_hashes` (legacy) and `image_features`; reads check features first, fall back to legacy. Flip `false` to retire the legacy path (§7.3). |
 
-### 9.1 Why scoring parameters aren't here
+### 9.2 Calibrated — empirically derived, change with evidence
 
-The match-time scoring values (γ, k, threshold, hash_size, etc.) are calibrated bridge behavior, not deployment-time knobs. Surfacing every one in `.env` would frame the bridge as a configuration product instead of a service. The values live in `bridge/app/settings.py` with provenance comments pointing at `docs/calibration/CALIBRATION_RESULTS.md`.
+These are the bridge's calibrated behavior, sourced from a 491-video Pexels corpus sweep (see [`calibration/CALIBRATION_RESULTS.md`](calibration/CALIBRATION_RESULTS.md)). Re-calibrating against a different corpus = re-run the sweep harness and update these values. Don't tune them without data.
 
-If empirical evidence ever shows the calibrated values regressing on a real-world corpus, the right response is to re-calibrate against that corpus and update the bridge's defaults — not to invite per-deploy override.
+| Variable                                       | Default                       | Source / purpose                                                                                                                                       |
+| ---------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `BRIDGE_HASH_ALGORITHM`                        | `phash`                       | Hash algorithm. Used by featurization AND per-request matching — single value.                                                                          |
+| `BRIDGE_HASH_SIZE`                             | `16`                          | Hash bit size. Used by featurization AND per-request matching.                                                                                          |
+| `BRIDGE_IMAGE_MODE`                            | `cover`                       | `cover` / `sprite` / `both`. Cover is fastest; `both` is most accurate but slow.                                                                        |
+| `BRIDGE_IMAGE_THRESHOLD`                       | `0.7`                         | Composite gate for scrape mode. Search mode is unaffected.                                                                                              |
+| `BRIDGE_SEARCH_LIMIT`                          | `5`                           | Top-N for search mode.                                                                                                                                  |
+| `BRIDGE_SPRITE_SAMPLE_SIZE`                    | `8`                           | Sprite frames sampled per scene in `sprite`/`both` modes.                                                                                               |
+| `BRIDGE_IMAGE_GAMMA`                           | `3.5`                         | Sharpening exponent on per-image similarities. **Run 3a peak** (concave; γ=2.0 lost 27 points to γ=3.5).                                               |
+| `BRIDGE_IMAGE_COUNT_K`                         | `0.25`                        | Count saturation `k` in `1 - exp(-Σw / k)`. **Run 3c peak** (sparse-N records were systematically under-weighted at k=2.0).                            |
+| `BRIDGE_IMAGE_MIN_CONTRIBUTION`                | `0.05`                        | A channel's S must clear this to count as "fired" for the bonus. **Run 3b peak** (higher excludes weak-but-correct contributions too aggressively).    |
+| `BRIDGE_IMAGE_BONUS_PER_EXTRA`                 | `0.1`                         | Bonus added per additional firing channel.                                                                                                              |
+| `BRIDGE_IMAGE_CHANNELS`                        | `phash,color_hist,tone`       | Comma-separated channel list. Drop `tone` for ~33% per-query speedup on Pexels-style mixed content (Run 7 found tone is silenced via uniqueness collapse there). |
+| `BRIDGE_IMAGE_SEARCH_FLOOR`                    | *(unset → disabled)*          | Optional search-mode confidence floor. **Run 6** found no global value separates weak-correct from weak-incorrect on the Pexels corpus; sharper-corpus deployments may set 0.10–0.20. |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA`            | `1.0`                         | Smoothing factor in `c_i = 1 / (1 + α·matches)`. **Run 5b flat** — varying didn't help.                                                                |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD`        | `0.85`                        | Similarity threshold above which two record images count as a near-duplicate for `c_i`. **Run 5a peak** (concave, both directions degrade).            |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH`  | *(unset → inherits global)*   | Per-channel override. **Run 7** confirmed defaults are optimal on Pexels; useful only for corpora where one channel needs distinct tuning.             |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE`   | *(unset → inherits global)*   | Per-channel override for tone. Counterintuitively, lifting this above the global *hurts* on natural-scene corpora (Run 7).                              |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH`      | *(unset → inherits global)*   | Per-channel α override for pHash.                                                                                                                       |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE`       | *(unset → inherits global)*   | Per-channel α override for tone.                                                                                                                        |
 
-A development-time escape hatch exists: `bridge/app/api/match.py::_resolve_match_params` prefers any value the request body supplies over the bridge default. Test harnesses and ad-hoc curl invocations can override per-call without touching the bridge process.
+### 9.3 Why "calibrated" is still in env, not Python code
+
+Earlier iterations of this doc argued these values should be hidden inside `bridge/app/settings.py`. That was wrong: re-calibration is configuration, and configuration belongs in env where it can be updated without code edits, version-controlled per deployment, and compared between corpora. The "don't tune without data" rule is enforced by documentation and the calibration provenance in §9.2's source column — not by hiding the values.

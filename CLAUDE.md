@@ -8,21 +8,20 @@ For _what_ to build, see [`requirements.md`](requirements.md). This file covers 
 
 ## 1. The bridge is a self-contained service; the scraper is a metadata transport
 
-> **All matching configuration lives on the bridge. The scraper passes a scene identifier and reads back a result — nothing else flows through it.**
+> **All matching configuration lives on the bridge, in env vars. The scraper passes a scene identifier and reads back a result — nothing else flows through it.**
 
-`stash-extract-db` is a black-box service. Input goes in (scene_id / url / name + mode), output comes out (Stash scraper-shaped JSON). The bridge owns:
+`stash-extract-db` is a black-box service. Input goes in (scene_id / url / name + mode), output comes out (Stash scraper-shaped JSON). All bridge configuration — operational and calibrated alike — lives in environment variables consumed by `bridge/app/settings.py`. Two groups, both in `.env`:
 
-- Match-time scoring values (`bridge_image_gamma`, `bridge_image_count_k`, `bridge_image_min_contribution`, `bridge_image_bonus_per_extra`, `bridge_image_threshold`, `bridge_image_mode`, `bridge_image_channels`, `bridge_image_search_floor`, `bridge_search_limit`, `bridge_sprite_sample_size`).
-- Hash config (`bridge_hash_algorithm`, `bridge_hash_size`).
-- Featurization config (`bridge_featurize_*`).
+- **Operational** (deploy-time): connection / auth, lifecycle toggles, concurrency, storage budgets.
+- **Calibrated** (empirically derived): hash config, match-time scoring values, featurization uniqueness parameters. These are sourced from the calibration sweep documented in `docs/calibration/CALIBRATION_RESULTS.md`. Re-calibration against a different corpus = re-run the sweep, update these values; same mechanism, same file.
 
-These are **calibrated** values, not user knobs (§13.9). Defaults live in `bridge/app/settings.py`. If the request body includes any of these fields, the bridge prefers the request value (used by test harnesses + calibration sweeps); production scrapers send nothing.
+If the request body to `/match/*` includes any scoring field, the bridge prefers the request value (used by test harnesses + calibration sweeps); production scrapers send nothing.
 
 The scraper script (`stash-extract-scraper/`) is intentionally minimal: stdlib only, ~80 lines, two configurable values (`BRIDGE_URL`, `REQUEST_TIMEOUT_S`). It reads a scene fragment from stdin, POSTs `{scene_id, mode}` to the bridge, prints the bridge's response. Stash invokes scrapers with a scene fragment on stdin — Stash has no concept of scoring parameters and no mechanism to inject them. That's why this configuration cannot live on the scraper side: there's no carrier.
 
-**Why this matters**: per-scraper or per-deployment scoring config is a category error. The bridge serves the same extractor data regardless of who's asking; one bridge configuration applies to every scraper request. Putting scoring on the scraper side meant manual config-file maintenance every time calibration moved a default — and Stash had no way to deliver new values to existing scraper installs.
+**Why this matters**: per-scraper or per-deployment scoring config-on-the-scraper was a category error. The bridge serves the same extractor data regardless of who's asking; one bridge configuration applies to every scraper request. Putting scoring on the scraper side meant manual config-file maintenance every time calibration moved a default — and Stash had no way to deliver new values to existing scraper installs.
 
-**Don't**: add scoring fields to `stash-extract-scraper/config.py`. **Don't**: read scoring config from anywhere outside the bridge process. **Don't**: ship the scraper bundle with calibrated values that need to match the bridge — the values aren't the scraper's concern.
+**Don't**: add scoring fields to `stash-extract-scraper/config.py`. **Don't**: hide scoring values inside Python code as if they were source-of-truth defaults — they belong in env where re-calibration doesn't require code edits. **Don't**: frame the calibrated scoring section as "user knobs" — the *values* are configuration, the *tuning policy* is "do not change without empirical evidence" (enforced by documentation and provenance comments).
 
 ---
 
