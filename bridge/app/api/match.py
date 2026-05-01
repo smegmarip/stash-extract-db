@@ -323,18 +323,40 @@ async def _match_with_scene(
     studio_for_filter: Optional[str],
     debug: bool = False,
 ):
+    scene_id = scene.get("id") or "<synth>"
+    scene_title = scene.get("title") or ""
+    logger.info(
+        "match: request mode=%s scene_id=%s title=%r studio=%r",
+        req.mode, scene_id, scene_title, studio_for_filter,
+    )
+
     jobs = await _scene_shaped_jobs()
     if not jobs:
+        logger.info("match: empty mode=%s reason=no_scene_shaped_jobs", req.mode)
         return [] if req.mode == "search" else {}
 
     selected, used_filter = _select_jobs_by_studio(jobs, studio_for_filter)
+    logger.info(
+        "match: studio_filter applied=%s scene_shaped_jobs=%d selected=%d",
+        used_filter, len(jobs), len(selected),
+    )
     if used_filter and not selected:
         # Per CLAUDE.md §5: studio set, no match → empty
+        logger.info(
+            "match: empty mode=%s reason=studio_filter_no_match studio=%r",
+            req.mode, studio_for_filter,
+        )
         return [] if req.mode == "search" else {}
 
     pool = await _build_candidate_pool(selected)
     if not pool:
+        logger.info(
+            "match: empty mode=%s reason=empty_candidate_pool selected_jobs=%d",
+            req.mode, len(selected),
+        )
         return [] if req.mode == "search" else {}
+
+    logger.info("match: candidate_pool size=%d", len(pool))
 
     alias_resolver = AliasResolver()
     p = _resolve_match_params(req)
@@ -351,7 +373,15 @@ async def _match_with_scene(
             image_bonus_per_extra=p["image_bonus_per_extra"],
         )
         if not winner:
+            logger.info(
+                "match: scrape empty reason=no_definitive_signal scene_id=%s pool=%d",
+                scene_id, len(pool),
+            )
             return {}
+        logger.info(
+            "match: scrape returning scene_id=%s job=%s idx=%d",
+            scene_id, winner["job_id"], winner["result_index"],
+        )
         out = await _record_to_scrape_result(winner, studio_for_filter, alias_resolver)
         return out.model_dump(exclude_none=True)
 
@@ -369,8 +399,10 @@ async def _match_with_scene(
         image_search_floor=p["image_search_floor"],
     )
     out: list[dict[str, Any]] = []
+    n_zero = 0
     for cand, score, dbg in ranked:
         if score <= 0:
+            n_zero += 1
             continue
         sr = await _record_to_scrape_result(cand, studio_for_filter, alias_resolver)
         d = sr.model_dump(exclude_none=True)
@@ -378,4 +410,8 @@ async def _match_with_scene(
         if dbg is not None:
             d["_debug"] = dbg
         out.append(d)
+    logger.info(
+        "match: search returning scene_id=%s pool=%d ranked=%d returned=%d zero_scores=%d",
+        scene_id, len(pool), len(ranked), len(out), n_zero,
+    )
     return out
