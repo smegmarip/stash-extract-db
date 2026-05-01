@@ -63,9 +63,27 @@ def _post(endpoint: str, body: dict) -> str:
         return "{}"
 
 
+def _overrides() -> dict:
+    """Operational overrides from config.py. None entries are dropped so
+    the bridge can apply its own default. Anything not surfaced here is
+    bridge-internal calibration (CLAUDE.md §1)."""
+    out: dict = {}
+    for key, attr in (
+        ("image_mode",         "IMAGE_MODE"),
+        ("threshold",          "IMAGE_THRESHOLD"),
+        ("limit",              "SEARCH_LIMIT"),
+        ("sprite_sample_size", "SPRITE_SAMPLE_SIZE"),
+    ):
+        v = getattr(config, attr, None)
+        if v is not None:
+            out[key] = v
+    return out
+
+
 def main():
     mode_arg = sys.argv[1] if len(sys.argv) > 1 else "fragment"
     payload = _read_stdin_json()
+    base = _overrides()
 
     if mode_arg == "fragment":
         # sceneByFragment — full scene fragment in stdin, look up by id
@@ -73,7 +91,7 @@ def main():
         if not scene_id:
             _emit({})
             return
-        body_text = _post("/match/fragment", {"scene_id": scene_id, "mode": "scrape"})
+        body_text = _post("/match/fragment", {**base, "scene_id": scene_id, "mode": "scrape"})
 
     elif mode_arg == "name":
         # sceneByName — Stash passes a search query
@@ -81,14 +99,14 @@ def main():
         if not name:
             print("[]")
             return
-        body_text = _post("/match/name", {"name": name, "mode": "search"})
+        body_text = _post("/match/name", {**base, "name": name, "mode": "search"})
 
     elif mode_arg == "query":
         # sceneByQueryFragment — user picked a search result; scrape it
         if payload.get("id"):
-            body_text = _post("/match/fragment", {"scene_id": str(payload["id"]), "mode": "scrape"})
+            body_text = _post("/match/fragment", {**base, "scene_id": str(payload["id"]), "mode": "scrape"})
         elif payload.get("url"):
-            body_text = _post("/match/url", {"url": str(payload["url"]), "mode": "scrape"})
+            body_text = _post("/match/url", {**base, "url": str(payload["url"]), "mode": "scrape"})
         else:
             _emit({})
             return
@@ -99,7 +117,7 @@ def main():
         if not url_in:
             _emit({})
             return
-        body_text = _post("/match/url", {"url": url_in, "mode": "scrape"})
+        body_text = _post("/match/url", {**base, "url": url_in, "mode": "scrape"})
 
     else:
         _eprint(f"scraper.py: unknown mode {mode_arg!r}")
