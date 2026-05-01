@@ -370,3 +370,53 @@ class TestPerChannelUniqueness:
         clean_settings.bridge_featurize_uniqueness_threshold = 0.85
         # color_hist isn't in the per-channel dict; falls back to global
         assert clean_settings.channel_uniqueness_threshold("color_hist") == 0.85
+
+
+class TestNegativeFeatureCache:
+    """Sentinel rows in image_features for "tried, no usable result" —
+    suppresses repeat fetch+compute attempts when an asset is unfetchable
+    (404) or its image is low-variance / undecodeable."""
+
+    async def test_get_returns_none_for_sentinel(self, bridge_db):
+        await bridge_db.set_feature_attempt_failed(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        )
+        # get_image_feature returns None on sentinel (same as miss for callers
+        # that just want the feature blob)
+        assert await bridge_db.get_image_feature(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        ) is None
+
+    async def test_is_feature_attempt_cached_distinguishes_miss(self, bridge_db):
+        await bridge_db.set_feature_attempt_failed(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        )
+        # Sentinel exists for this exact key
+        assert await bridge_db.is_feature_attempt_cached(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        ) is True
+        # No sentinel for a different ref → caller will fetch
+        assert await bridge_db.is_feature_attempt_cached(
+            "extractor_image", "j1:other_ref", "fp", "phash", "phash:16",
+        ) is False
+
+    async def test_sentinel_does_not_collide_with_success(self, bridge_db):
+        # A successful row exists for one channel
+        await bridge_db.set_image_feature(
+            "extractor_image", "j1:ref", "fp", "color_hist", "color_hist:hsv:4x4x4",
+            b"\x01\x02", 0.7,
+        )
+        # Sentinel for a different channel on the same ref
+        await bridge_db.set_feature_attempt_failed(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        )
+        # Success channel still readable normally
+        success = await bridge_db.get_image_feature(
+            "extractor_image", "j1:ref", "fp", "color_hist", "color_hist:hsv:4x4x4",
+        )
+        assert success == (b"\x01\x02", 0.7)
+        # Failed channel returns None
+        failed = await bridge_db.get_image_feature(
+            "extractor_image", "j1:ref", "fp", "phash", "phash:16",
+        )
+        assert failed is None

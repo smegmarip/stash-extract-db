@@ -238,6 +238,13 @@ async def set_image_hash(source: str, ref_id: str, fingerprint: str, algorithm: 
 _STASH_SOURCES = ("stash_cover", "stash_sprite", "stash_aggregate")
 
 
+# Sentinel quality value indicating "we tried to compute this feature and
+# couldn't" (asset 404, decode failed, low-variance pHash filter, etc.).
+# Stored to suppress repeat fetch+compute attempts on every scrape; cleared
+# by the same cascade invalidation that clears successful rows.
+NEGATIVE_CACHE_QUALITY = -1.0
+
+
 async def get_image_feature(
     source: str, ref_id: str, fingerprint: str, channel: str, algorithm: str,
 ) -> Optional[tuple[bytes, float]]:
@@ -247,10 +254,14 @@ async def get_image_feature(
     the caller's is treated as a miss (the source content has changed; the
     cached blob is stale).
 
+    A row with quality == NEGATIVE_CACHE_QUALITY is a "tried, no usable result"
+    sentinel and is also returned as None — but the caller short-circuits the
+    fetch+compute retry. Use `is_feature_attempt_cached` to distinguish miss
+    from sentinel.
+
     Side effect: on a Stash-side hit, updates `last_accessed_at` to support
-    LRU eviction (CLAUDE.md §14.9). Extractor-side
-    rows skip the touch — they're cleared by job-cascade invalidation, not
-    LRU, and the write would just create cache pressure.
+    LRU eviction (CLAUDE.md §14.9). Extractor-side rows skip the touch — they're
+    cleared by job-cascade invalidation, not LRU.
     """
     async with db().execute(
         "SELECT feature_blob, quality FROM image_features "
@@ -259,6 +270,9 @@ async def get_image_feature(
     ) as cur:
         row = await cur.fetchone()
     if row is None:
+        return None
+    if row[1] == NEGATIVE_CACHE_QUALITY:
+        # Sentinel: prior compute failed; caller should not retry.
         return None
     if source in _STASH_SOURCES:
         from datetime import datetime
@@ -269,6 +283,37 @@ async def get_image_feature(
         )
         await db().commit()
     return (row[0], row[1])
+
+
+async def is_feature_attempt_cached(
+    source: str, ref_id: str, fingerprint: str, channel: str, algorithm: str,
+) -> bool:
+    """True if a row exists for this (source, ref, channel, algo, fingerprint)
+    — whether successful or a negative-cache sentinel. Lets callers
+    short-circuit the fetch+compute path without first attempting to read
+    the (possibly missing) feature blob.
+    """
+    async with db().execute(
+        "SELECT 1 FROM image_features "
+        "WHERE source=? AND ref_id=? AND channel=? AND algorithm=? AND fingerprint=? "
+        "LIMIT 1",
+        (source, ref_id, channel, algorithm, fingerprint),
+    ) as cur:
+        row = await cur.fetchone()
+    return row is not None
+
+
+async def set_feature_attempt_failed(
+    source: str, ref_id: str, fingerprint: str, channel: str, algorithm: str,
+) -> None:
+    """Write a negative-cache sentinel row indicating "we tried to compute
+    this feature and couldn't" (asset 404, decode failure, low-variance
+    filter, etc.). Suppresses repeat fetch+compute attempts on every scrape.
+    """
+    await set_image_feature(
+        source, ref_id, fingerprint, channel, algorithm,
+        feature_blob=b"", quality=NEGATIVE_CACHE_QUALITY,
+    )
 
 
 async def set_image_feature(

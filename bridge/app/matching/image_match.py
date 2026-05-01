@@ -78,12 +78,16 @@ async def _hash_or_compute(
     new_algo = _phash_algo_key(algorithm, hash_size)
     use_legacy = settings.bridge_legacy_dual_write_enabled
 
-    # Read path: image_features first; legacy image_hashes fallback only
-    # when dual-write is still active.
+    # Read path: image_features first (catches both successful rows and
+    # negative-cache sentinels — sentinel returns None and the
+    # is_feature_attempt_cached check below short-circuits the fetch).
     cached_feat = await cdb.get_image_feature(source, ref_id, fingerprint, "phash", new_algo)
     if cached_feat is not None:
         blob, _quality = cached_feat
         return hex_to_hash(blob.hex())
+    if await cdb.is_feature_attempt_cached(source, ref_id, fingerprint, "phash", new_algo):
+        # Prior attempt cached as failed — don't retry.
+        return None
     if use_legacy:
         cached_hex = await cdb.get_image_hash(source, ref_id, fingerprint, algorithm, hash_size)
         if cached_hex:
@@ -91,6 +95,9 @@ async def _hash_or_compute(
 
     data = await fetcher()
     if not data:
+        # Asset unfetchable (404, network error). Cache the failure so
+        # future scrapes don't re-attempt the same fetch.
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "phash", new_algo)
         return None
     try:
         # Offload PIL/imagehash/numpy compute to a thread so the event
@@ -99,9 +106,11 @@ async def _hash_or_compute(
         result = await asyncio.to_thread(hash_image_bytes, data, algorithm, hash_size)
     except Exception as e:
         logger.warning("hash failed source=%s ref=%s :: %s", source, ref_id, e)
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "phash", new_algo)
         return None
     if result is None:
         logger.debug("skipping low-variance image source=%s ref=%s", source, ref_id)
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "phash", new_algo)
         return None
     h, q = result
     h_hex = str(h)
@@ -235,14 +244,31 @@ async def _features_or_compute_bc(
         out["color_hist"] = (bytes(cached_b[0]), cached_b[1])
     if cached_c is not None:
         out["tone"] = (bytes(cached_c[0]), cached_c[1])
-    if out["color_hist"] is not None and out["tone"] is not None:
+
+    # Negative-cache check: if there's already a row for each channel
+    # (sentinel or success), don't refetch. cached_X above is None for
+    # both miss and sentinel; is_feature_attempt_cached distinguishes.
+    b_attempted = out["color_hist"] is not None or await cdb.is_feature_attempt_cached(
+        source, ref_id, fingerprint, "color_hist", CHANNEL_B_ALGO,
+    )
+    c_attempted = out["tone"] is not None or await cdb.is_feature_attempt_cached(
+        source, ref_id, fingerprint, "tone", CHANNEL_C_ALGO,
+    )
+    if b_attempted and c_attempted:
         return out
 
     data = await fetcher()
     if not data:
+        # Asset unfetchable. Mark sentinel for whichever channels weren't
+        # already cached (success or failure) so we don't refetch on every
+        # subsequent scrape.
+        if not b_attempted:
+            await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "color_hist", CHANNEL_B_ALGO)
+        if not c_attempted:
+            await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "tone", CHANNEL_C_ALGO)
         return out
 
-    if out["color_hist"] is None:
+    if not b_attempted:
         # PIL decode + HSV histogram is CPU-bound — offload to thread.
         bres = await asyncio.to_thread(color_hist_from_bytes, data)
         if bres is not None:
@@ -252,7 +278,9 @@ async def _features_or_compute_bc(
                 source, ref_id, fingerprint, "color_hist", CHANNEL_B_ALGO, blob_bytes, q,
             )
             out["color_hist"] = (blob_bytes, q)
-    if out["tone"] is None:
+        else:
+            await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "color_hist", CHANNEL_B_ALGO)
+    if not c_attempted:
         # Same: PIL decode + LANCZOS resize + entropy/variance is CPU-bound.
         cres = await asyncio.to_thread(tone_from_bytes, data)
         if cres is not None:
@@ -262,6 +290,8 @@ async def _features_or_compute_bc(
                 source, ref_id, fingerprint, "tone", CHANNEL_C_ALGO, blob_bytes, q,
             )
             out["tone"] = (blob_bytes, q)
+        else:
+            await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "tone", CHANNEL_C_ALGO)
     return out
 
 
