@@ -45,6 +45,14 @@ class Settings(BaseSettings):
     bridge_embedding_dtype: str = "fp16"         # fp16 | fp32
     bridge_embedding_batch_size: int = 16
     bridge_embedding_threshold: float = 0.7       # scrape-mode gate; cosine scale
+    # Two-pass matching: D ranks all candidates in one matmul, then A/B/C
+    # re-score only the top-K survivors (the §13 composite formula combines
+    # them). Total cost stays at the embedding-only level (~ms for D + a
+    # bounded amount of A/B/C work on K candidates) while preserving the
+    # corroboration bonus that catches D's concept-only failure mode. See
+    # docs/SEMANTIC_PREFILTER_PLAN.md. Set to 0 to disable two-pass; the
+    # composite is computed against every candidate (legacy single-pass).
+    bridge_embedding_prefilter_k: int = 10
 
     @property
     def image_channels(self) -> list[str]:

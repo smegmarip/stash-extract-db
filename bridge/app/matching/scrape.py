@@ -10,7 +10,10 @@ from fastapi import HTTPException
 
 from ..settings import settings
 from .text import studio_and_code_fires, exact_title_fires
-from .image_match import all_pair_sims, aggregate_scrape, score_image_channel_a, score_image_composite
+from .image_match import (
+    all_pair_sims, aggregate_scrape, score_image_channel_a,
+    score_image_channel_d_batch, score_image_composite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,16 +69,59 @@ async def scrape(
     use_new = settings.bridge_new_scoring_enabled
     use_multi = bool(use_new and image_channels and len(image_channels) >= 1
                      and set(image_channels) != {"phash"})
+
+    # Two-pass: D batch-ranks all candidates in one matmul, then A/B/C
+    # re-score only the top-K survivors. Disabled when D isn't in the
+    # channel list, when embedding is globally off, or when K=0.
+    # See docs/SEMANTIC_PREFILTER_PLAN.md.
+    K = settings.bridge_embedding_prefilter_k
+    use_two_pass = bool(
+        use_multi
+        and image_channels and "embedding" in image_channels
+        and settings.bridge_embedding_enabled
+        and K > 0
+        and K < n_cand
+    )
+    cands_to_score = candidates
+    cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
+    if use_two_pass:
+        d_results = await score_image_channel_d_batch(
+            scene, candidates, image_mode, sprite_sample_size,
+        )
+        # Sort all candidates by D score desc; take top K. Tiebreak by
+        # (job_id, result_index) for determinism per CLAUDE.md §10.
+        ranked = sorted(
+            candidates,
+            key=lambda c: (
+                -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
+                c["job_id"], c["result_index"],
+            ),
+        )
+        cands_to_score = ranked[:K]
+        cached_d_per_cand = {
+            (c["job_id"], c["result_index"]): {
+                "embedding": d_results[(c["job_id"], c["result_index"])]
+            }
+            for c in cands_to_score
+        }
+        logger.info(
+            "scrape: tier=image two-pass D-batch n=%d → top_k=%d",
+            n_cand, len(cands_to_score),
+        )
+
     scoring_path = "multi" if use_multi else ("channel_a" if use_new else "legacy")
+    if use_two_pass:
+        scoring_path += "+prefilter"
     logger.info(
-        "scrape: tier=image scoring=%s mode=%s threshold=%.3f n=%d",
-        scoring_path, image_mode, threshold, n_cand,
+        "scrape: tier=image scoring=%s mode=%s threshold=%.3f n=%d (scored=%d)",
+        scoring_path, image_mode, threshold, n_cand, len(cands_to_score),
     )
 
     matches: list[tuple[dict[str, Any], float]] = []
     raw_top: tuple[float, str, int] = (0.0, "", -1)  # (best raw composite, job, idx)
-    for c in candidates:
+    for c in cands_to_score:
         if use_multi:
+            cached = cached_d_per_cand.get((c["job_id"], c["result_index"]))
             res = await score_image_composite(
                 scene, c["job_id"], c["data"], c["result_index"],
                 image_mode, algorithm, hash_size, sprite_sample_size,
@@ -83,6 +129,7 @@ async def scrape(
                 channels=image_channels,
                 min_contribution=image_min_contribution,
                 bonus_per_extra=image_bonus_per_extra,
+                cached_channels=cached,
             )
             raw = res["S"]
             score = raw if raw >= threshold else 0.0

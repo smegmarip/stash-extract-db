@@ -24,7 +24,10 @@ from .text import (
     date_score, performer_score,
 )
 from .filename import filename_score, filename_score_debug
-from .image_match import all_pair_sims, aggregate_search, score_image_channel_a, score_image_composite
+from .image_match import (
+    all_pair_sims, aggregate_search, score_image_channel_a,
+    score_image_channel_d_batch, score_image_composite,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +95,46 @@ async def search(
     use_multi = bool(use_new and image_channels and len(image_channels) >= 1
                      and set(image_channels) != {"phash"})
 
+    n_cand = len(candidates)
+
+    # Two-pass: D batch-ranks all candidates in one matmul, then A/B/C
+    # re-score only the top-K survivors. Search-mode caveat: candidates
+    # outside the top-K still appear in the result set but with image
+    # contribution computed from D's batch score only (no A/B/C corroboration
+    # bonus for them). That keeps top-N=limit working when limit > K.
+    # See docs/SEMANTIC_PREFILTER_PLAN.md.
+    K = settings.bridge_embedding_prefilter_k
+    use_two_pass = bool(
+        use_multi
+        and image_channels and "embedding" in image_channels
+        and settings.bridge_embedding_enabled
+        and K > 0
+        and K < n_cand
+    )
+    cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
+    if use_two_pass:
+        d_results = await score_image_channel_d_batch(
+            scene, candidates, image_mode, sprite_sample_size,
+        )
+        ranked = sorted(
+            candidates,
+            key=lambda c: (
+                -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
+                c["job_id"], c["result_index"],
+            ),
+        )
+        top_k_keys = {(c["job_id"], c["result_index"]) for c in ranked[:K]}
+        cached_d_per_cand = {
+            (c["job_id"], c["result_index"]): {
+                "embedding": d_results[(c["job_id"], c["result_index"])]
+            }
+            for c in ranked[:K]
+        }
+        logger.info(
+            "search: image two-pass D-batch n=%d → re-score top_k=%d",
+            n_cand, len(top_k_keys),
+        )
+
     stash_basename = _stash_basename(scene)
     scored: list[tuple[dict[str, Any], float, Optional[dict[str, Any]]]] = []
 
@@ -108,16 +151,33 @@ async def search(
             score += 1.0
 
         if use_multi:
-            res = await score_image_composite(
-                scene, c["job_id"], rec, c["result_index"],
-                image_mode, algorithm, hash_size, sprite_sample_size,
-                gamma=image_gamma, count_k=image_count_k,
-                channels=image_channels,
-                min_contribution=image_min_contribution,
-                bonus_per_extra=image_bonus_per_extra,
-            )
-            image_contrib = res["S"]
-            image_dbg_extra = res
+            cand_key = (c["job_id"], c["result_index"])
+            # Two-pass split: top-K candidates get the full A/B/C+D
+            # composite (with cached D); candidates outside the top K
+            # get a D-only score from the batch result. Both call paths
+            # produce a `res` dict with the same shape; only the channels
+            # populated differ.
+            if use_two_pass and cand_key not in cached_d_per_cand:
+                d_only = d_results[cand_key]
+                image_contrib = d_only["S"]
+                image_dbg_extra = {
+                    "S": d_only["S"],
+                    "fired": ["embedding"] if d_only["S"] >= image_min_contribution else [],
+                    "channels": {"embedding": d_only},
+                }
+            else:
+                cached = cached_d_per_cand.get(cand_key)
+                res = await score_image_composite(
+                    scene, c["job_id"], rec, c["result_index"],
+                    image_mode, algorithm, hash_size, sprite_sample_size,
+                    gamma=image_gamma, count_k=image_count_k,
+                    channels=image_channels,
+                    min_contribution=image_min_contribution,
+                    bonus_per_extra=image_bonus_per_extra,
+                    cached_channels=cached,
+                )
+                image_contrib = res["S"]
+                image_dbg_extra = res
         elif use_new:
             res = await score_image_channel_a(
                 scene, c["job_id"], rec, image_mode,

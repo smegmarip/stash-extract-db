@@ -1174,6 +1174,119 @@ async def score_image_channel_d(
     }
 
 
+async def score_image_channel_d_batch(
+    scene: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    image_mode: str,
+    sprite_sample_size: int,
+) -> dict[tuple[str, int], dict[str, Any]]:
+    """Channel D scoring for a batch of candidates against one scene, in
+    a single matrix multiply. Returns {(job_id, result_index): channel_d_dict}
+    where each value matches the shape of `score_image_channel_d`'s output.
+
+    The win versus calling `score_image_channel_d` per candidate is structural:
+    the scene's Stash-side embeddings are computed once, all extractor-side
+    embeddings stack into one matrix, and one matmul produces the full
+    M × sum(N_i) similarity matrix. With 1500 candidates × 9 images and one
+    Stash scene, this is ~50 ms total.
+    """
+    from . import embedding as emb
+    import numpy as _np
+
+    # Stash side: encode once for the scene. Identical to the per-candidate
+    # path; cached in image_features after first call.
+    stash_blobs: list[bytes] = []
+    if image_mode in ("cover", "both"):
+        cb = await stash_cover_embedding(scene)
+        if cb is not None:
+            stash_blobs.append(cb)
+    if image_mode in ("sprite", "both"):
+        sprite_blobs = await stash_sprite_embeddings(scene, sprite_sample_size)
+        for sb in sprite_blobs:
+            if sb is not None:
+                stash_blobs.append(sb)
+    M = len(stash_blobs)
+
+    # Empty Stash side → every candidate scores 0; short-circuit before
+    # touching extractor embeddings.
+    if M == 0:
+        return {
+            (c["job_id"], c["result_index"]): {
+                "S": 0.0, "per_image_max": [], "extractor_refs": [],
+                "n_extractor_images": 0, "n_stash_hashes": 0,
+                "scoring": "embedding",
+            }
+            for c in candidates
+        }
+
+    # Extractor side: collect per-candidate slices. Track refs alongside
+    # blobs so the per-candidate dict can carry the same `extractor_refs`
+    # field as the per-candidate scorer (the dict is consumed by the debug
+    # envelope downstream).
+    offsets: list[tuple[int, int]] = []
+    refs_per_cand: list[list[str]] = []
+    all_blobs: list[bytes] = []
+    for c in candidates:
+        refs: list[str] = list(c["data"].get("images") or [])
+        cover = c["data"].get("cover_image")
+        if cover and cover not in refs:
+            refs = [cover] + refs
+        start = len(all_blobs)
+        kept_refs: list[str] = []
+        for ref in refs:
+            try:
+                blob = await extractor_image_embedding(c["job_id"], ref)
+            except Exception as e:
+                logger.warning(
+                    "score D batch: extractor embed failed job=%s ref=%s :: %s",
+                    c["job_id"], ref, e,
+                )
+                blob = None
+            if blob is not None:
+                all_blobs.append(blob)
+                kept_refs.append(ref)
+        offsets.append((start, len(all_blobs)))
+        refs_per_cand.append(kept_refs)
+
+    if not all_blobs:
+        return {
+            (c["job_id"], c["result_index"]): {
+                "S": 0.0, "per_image_max": [], "extractor_refs": [],
+                "n_extractor_images": 0, "n_stash_hashes": M,
+                "scoring": "embedding",
+            }
+            for c in candidates
+        }
+
+    # Single matmul: M Stash embeddings × sum(N_i) extractor embeddings.
+    stash_mat = _np.stack([emb.blob_to_embedding(b) for b in stash_blobs])  # (M, D)
+    extr_mat = _np.stack([emb.blob_to_embedding(b) for b in all_blobs])      # (sum_N, D)
+    sims = emb.cosine_sim_matrix(stash_mat, extr_mat)                        # (M, sum_N)
+
+    results: dict[tuple[str, int], dict[str, Any]] = {}
+    for (start, end), refs, c in zip(offsets, refs_per_cand, candidates):
+        key = (c["job_id"], c["result_index"])
+        if start == end:
+            results[key] = {
+                "S": 0.0, "per_image_max": [], "extractor_refs": [],
+                "n_extractor_images": 0, "n_stash_hashes": M,
+                "scoring": "embedding",
+            }
+            continue
+        slice_sims = sims[:, start:end]                       # (M, N_i)
+        per_image_max = slice_sims.max(axis=0).tolist()       # (N_i,)
+        S = float(sum(per_image_max) / len(per_image_max))
+        results[key] = {
+            "S": S,
+            "per_image_max": per_image_max,
+            "extractor_refs": refs,
+            "n_extractor_images": end - start,
+            "n_stash_hashes": M,
+            "scoring": "embedding",
+        }
+    return results
+
+
 async def score_image_composite(
     scene: dict[str, Any],
     job_id: str,
@@ -1188,6 +1301,7 @@ async def score_image_composite(
     channels: list[str],
     min_contribution: float,
     bonus_per_extra: float,
+    cached_channels: Optional[dict[str, dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Run all requested channels and compose. `channels` is the ordered
     list from the scraper config — only those listed are evaluated.
@@ -1232,9 +1346,15 @@ async def score_image_composite(
         )
 
     if "embedding" in channels:
-        d = await score_image_channel_d(
-            scene, job_id, record, image_mode, sprite_sample_size,
-        )
+        # Two-pass path: scrape/search hands us D's score from the batch
+        # prefilter, so we don't recompute it here. cached_channels is
+        # private to that wiring; legacy single-pass leaves it None.
+        if cached_channels and "embedding" in cached_channels:
+            d = cached_channels["embedding"]
+        else:
+            d = await score_image_channel_d(
+                scene, job_id, record, image_mode, sprite_sample_size,
+            )
         per_channel_debug["embedding"] = d
         # Embedding has no E/count_conf/dist_q — fill neutral values so
         # the existing compose() math still works. S carries everything.
