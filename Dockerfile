@@ -32,7 +32,7 @@ RUN pip install --no-cache-dir \
     "rapidfuzz>=3.10" \
     "imagehash>=4.3" \
     "Pillow>=11.0" \
-    "numpy>=2.1" \
+    "numpy<2" \
     "guessit>=3.8" \
     "transformers>=4.40"
 
