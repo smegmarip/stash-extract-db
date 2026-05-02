@@ -413,7 +413,76 @@ These are the bridge's calibrated behavior, sourced from a 491-video Pexels corp
 | `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE`   | *(unset → inherits global)*   | Per-channel override for tone. Counterintuitively, lifting this above the global *hurts* on natural-scene corpora (Run 7).                              |
 | `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH`      | *(unset → inherits global)*   | Per-channel α override for pHash.                                                                                                                       |
 | `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE`       | *(unset → inherits global)*   | Per-channel α override for tone.                                                                                                                        |
+| `BRIDGE_EMBEDDING_ENABLED`                     | `false`                       | Channel D (DINOv2 semantic embedding). Disabled by default; flip to `true` and add `embedding` to `BRIDGE_IMAGE_CHANNELS` to engage. See §10.            |
+| `BRIDGE_EMBEDDING_MODEL`                       | `facebook/dinov2-large`       | HuggingFace model id. Determines embedding dim + algorithm string. Common alternatives: `facebook/dinov2-base` (faster, 768-dim), `facebook/dinov2-giant` (best, 1536-dim, ~10GB VRAM). |
+| `BRIDGE_EMBEDDING_DEVICE`                      | `auto`                        | `auto` / `cuda` / `cpu`. `auto` picks CUDA if available, else CPU.                                                                                       |
+| `BRIDGE_EMBEDDING_DTYPE`                       | `fp16`                        | `fp16` / `fp32`. fp16 halves VRAM and is faster on Ampere+ GPUs (A4000). Forced to fp32 when running on CPU.                                            |
+| `BRIDGE_EMBEDDING_BATCH_SIZE`                  | `16`                          | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                |
+| `BRIDGE_EMBEDDING_THRESHOLD`                   | `0.7`                         | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                |
+| `DOCKER_RUNTIME` *(compose)*                   | `nvidia`                      | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).             |
 
 ### 9.3 Why "calibrated" is still in env, not Python code
 
 Earlier iterations of this doc argued these values should be hidden inside `bridge/app/settings.py`. That was wrong: re-calibration is configuration, and configuration belongs in env where it can be updated without code edits, version-controlled per deployment, and compared between corpora. The "don't tune without data" rule is enforced by documentation and the calibration provenance in §9.2's source column — not by hiding the values.
+
+---
+
+## 10. Channel D: semantic embedding (DINOv2)
+
+For corpora where pHash + color_hist + tone produce weak signals (low-resolution video, content that differs structurally from the calibration set), the bridge supports a fourth scoring channel using a learned visual embedding model. Cosine similarity in DINOv2's embedding space approximates semantic similarity — "do these two images depict the same scene" — independent of corpus characteristics.
+
+See [`SEMANTIC_MIGRATION_PLAN.md`](SEMANTIC_MIGRATION_PLAN.md) for the architectural rationale.
+
+### 10.1 Activation
+
+```bash
+# In .env:
+DOCKER_RUNTIME=nvidia                   # or runc on CPU-only hosts
+BRIDGE_EMBEDDING_ENABLED=true
+BRIDGE_IMAGE_CHANNELS=phash,color_hist,tone,embedding
+# (or BRIDGE_IMAGE_CHANNELS=embedding to use embedding alone)
+
+# Then:
+docker compose up -d --build --force-recreate stash-extract-db
+```
+
+First boot downloads the model weights to a persistent docker volume (`huggingface_cache`); subsequent recreates reuse the cache. Featurization for any non-`ready` job proceeds as usual but now also computes channel-D embeddings — adds ~15s per 1500-record job on a CUDA GPU, ~5–10 minutes on CPU.
+
+### 10.2 GPU passthrough setup
+
+The bridge container needs the NVIDIA Container Toolkit on the host:
+
+```bash
+# Ubuntu / Debian:
+sudo apt-get install nvidia-container-toolkit
+sudo nvidia-ctk runtime configure --runtime=docker
+sudo systemctl restart docker
+
+# Verify:
+docker run --rm --runtime=nvidia --gpus all nvidia/cuda:12.1.0-base-ubuntu22.04 nvidia-smi
+```
+
+Once the host is configured, `docker compose up -d --build` engages the GPU automatically because `runtime: ${DOCKER_RUNTIME:-nvidia}` in `docker-compose.yml` defaults to nvidia.
+
+### 10.3 CPU fallback
+
+For dev hosts without a CUDA GPU:
+
+```bash
+# In .env:
+DOCKER_RUNTIME=runc
+BRIDGE_EMBEDDING_DEVICE=cpu
+```
+
+Same code path; ~10× slower per-image inference. Featurization moves from ~15s to several minutes; per-scrape latency rises from ~300 ms to ~1–3s. Still well under the Stash 90s timeout.
+
+### 10.4 Verifying the channel is firing
+
+```bash
+curl -s -X POST 'http://localhost:13000/match/fragment?debug=1' \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id":"<id>","mode":"search","image_channels":["embedding"]}' \
+  | jq '.[0]._debug.image.channels.embedding'
+```
+
+You should see `S` (cosine mean), `per_image_max` (per-record-image best cosines), `n_extractor_images`, `n_stash_hashes`. If `n_extractor_images=0`, the record's embeddings haven't been featurized yet (check `/api/featurization/status`). If `n_stash_hashes=0`, the Stash side couldn't fetch sprite/cover; check the bridge logs.

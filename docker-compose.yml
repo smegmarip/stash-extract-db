@@ -2,6 +2,10 @@ services:
   stash-extract-db:
     build: .
     container_name: stash-extract-db
+    # GPU access via docker runtime — pattern matches stash-auto-vision.
+    # Override DOCKER_RUNTIME=runc on hosts without a CUDA GPU; the
+    # bridge will fall back to CPU embedding via BRIDGE_EMBEDDING_DEVICE.
+    runtime: ${DOCKER_RUNTIME:-nvidia}
     restart: unless-stopped
     ports:
       - "${BRIDGE_PORT:-13000}:13000"
@@ -45,14 +49,40 @@ services:
       BRIDGE_STASH_FEATURE_BUDGET_BYTES: "${BRIDGE_STASH_FEATURE_BUDGET_BYTES:-1073741824}"
       BRIDGE_LRU_EVICTION_INTERVAL_S: "${BRIDGE_LRU_EVICTION_INTERVAL_S:-3600}"
       BRIDGE_LEGACY_DUAL_WRITE_ENABLED: "${BRIDGE_LEGACY_DUAL_WRITE_ENABLED:-true}"
+
+      # Channel D: semantic embedding (DINOv2). Disabled by default;
+      # flip to true to enable embedding compute at featurization time
+      # and embedding-based scoring. See docs/SEMANTIC_MIGRATION_PLAN.md.
+      BRIDGE_EMBEDDING_ENABLED: "${BRIDGE_EMBEDDING_ENABLED:-false}"
+      BRIDGE_EMBEDDING_MODEL: "${BRIDGE_EMBEDDING_MODEL:-facebook/dinov2-large}"
+      BRIDGE_EMBEDDING_DEVICE: "${BRIDGE_EMBEDDING_DEVICE:-auto}"
+      BRIDGE_EMBEDDING_DTYPE: "${BRIDGE_EMBEDDING_DTYPE:-fp16}"
+      BRIDGE_EMBEDDING_BATCH_SIZE: "${BRIDGE_EMBEDDING_BATCH_SIZE:-16}"
+      BRIDGE_EMBEDDING_THRESHOLD: "${BRIDGE_EMBEDDING_THRESHOLD:-0.7}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - "${DATA_PATH:-./data}:/data"
+      # Persist torch + huggingface model caches across container
+      # recreates so DINOv2 weights (~1.2 GB) only download once.
+      - torch_cache:/root/.cache/torch
+      - huggingface_cache:/root/.cache/huggingface
     networks:
       - extractor_network
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:13000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      # Generous boot window — first-time model download + load can
+      # take up to a couple minutes on cold caches.
+      start_period: 120s
 
 networks:
   extractor_network:
     name: ${DOCKER_NETWORK:-extractor_network}
     external: true
+
+volumes:
+  torch_cache:
+  huggingface_cache:

@@ -293,7 +293,22 @@ These are the bridge's calibrated behavior, not deployment-time knobs. Defaults 
 | `bridge_featurize_uniqueness_alpha`           | 1.0     | Run 5b flat       |
 | `bridge_featurize_uniqueness_*_phash/_tone`   | None    | Run 7 (per-channel mechanism present as escape hatch; tone-specific override unhelpful on Pexels-style corpora — c_i collapse silences a noisy channel, which is the desired behavior) |
 
-### 13.10 Don'ts
+### 13.10 Channel D: semantic embedding (DINOv2)
+
+> **Channel D operates in a learned embedding space rather than over hand-engineered hash features. Cosine similarity in DINOv2's space approximates semantic similarity directly. None of the per-channel mechanisms (sharpening, baseline subtraction, count saturation, distribution-shape, c_i, q_i) apply — the embedding space is corpus-independent and self-normalizing.**
+
+**Why D exists alongside A/B/C**: the calibrated mechanism in §13.2-§13.6 normalizes against a per-corpus noise floor. Calibrated values from one corpus (Pexels-style mixed natural content) systematically underperform on different corpora (low-resolution video, single-studio content, etc.). Calibration is per-corpus by design; embeddings sidestep that.
+
+**Compute path**:
+1. **Featurize**: per-image embeddings via DINOv2 ViT-L/14 (default), stored in `image_features` with `channel='embedding'` and a versioned `algorithm` string (`<model>:<dtype>:<dim>`). One row per image, ~2KB fp16.
+2. **Match**: stack the record's cached extractor embeddings into matrix `E ∈ R^(N × D)`; stack the scene's Stash embeddings (computed lazily, cached) into `S ∈ R^(M × D)`; compute `sims = S @ E.T` → take per-extractor-image max → mean. Returns `S` in roughly [0, 1] for natural images.
+3. **Compose**: D participates in `score_image_composite` exactly like A/B/C — the existing `max(fired) + bonus * (n_fired - 1)` math applies, with channel D firing whenever its cosine-mean exceeds `BRIDGE_IMAGE_MIN_CONTRIBUTION`.
+
+**Activation**: gated by `BRIDGE_EMBEDDING_ENABLED=true` AND `embedding` in `BRIDGE_IMAGE_CHANNELS`. When ENABLED is true but `embedding` isn't in the channel list, featurization still computes embeddings (they're cheap to keep) but scoring ignores them.
+
+**Calibration coverage gap**: §13.9's calibrated values were tuned against high-quality Pexels content. On 240p video, single-studio corpora, monochrome film, etc., A/B/C all degrade. D doesn't — that's the entire point. **The right escape hatch when calibrated A/B/C scoring underperforms is to add D, not to change the calibrated values.**
+
+### 13.11 Don'ts
 
 - **Don't** revert to single-channel scoring "because it's simpler" — single-channel was the bug.
 - **Don't** compose channels by mean or product. Mean dilutes a strong channel's signal; product zeros the composite when one channel doesn't fire.
@@ -303,6 +318,8 @@ These are the bridge's calibrated behavior, not deployment-time knobs. Defaults 
 - **Don't** use IDF (`log(N/n)/log(N)`) for `c_i`. Records typically have N ≤ 5; IDF collapses too fast at small N (at N=2 with 1 match, c_i = 0). The smoothed reciprocal is the canonical form.
 - **Don't** append `0.0` entries for failed/uniform images — they're noise and tempt future maintainers to "fix" them. The list length should equal the number of usable comparisons, not the number of attempted ones.
 - **Don't** change the canonical defaults (§13.9) without a corresponding calibration run appended to `docs/calibration/CALIBRATION_RESULTS.md`. The defaults are empirical, not aesthetic.
+- **Don't** apply A/B/C-style sharpening or count-saturation to channel D. Cosine similarity is already in [-1, 1] and corpus-independent — sharpening it against a per-job baseline reintroduces the calibration problem D was created to avoid.
+- **Don't** put A/B/C-style `c_i` weights on D embeddings. Repeated images in a record contribute their own embedding similarity each time; the average gives them appropriate weight. Adding c_i correction would double-count the dedup-safety the embedding space already provides.
 
 ---
 

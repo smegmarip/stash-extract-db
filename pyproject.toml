@@ -18,6 +18,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+embedding = [
+    # Channel D (semantic similarity). Installed only in the GPU image
+    # by default; CPU builds and tests can install via `pip install .[embedding]`.
+    "torch>=2.2",
+    "transformers>=4.40",
+]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",
