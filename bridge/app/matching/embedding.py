@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import threading
 from typing import Optional
 
 import numpy as np
@@ -33,6 +34,12 @@ logger = logging.getLogger(__name__)
 _MODEL = None
 _PROCESSOR = None
 _ALGO_KEY: Optional[str] = None
+
+# Concurrent featurization workers all hit _load_model on first use; without
+# a lock they race to download/instantiate the model in parallel and burn
+# VRAM. The lock serializes the load itself; subsequent calls hit the fast
+# path (None check) before acquiring.
+_LOAD_LOCK = threading.Lock()
 
 
 def _resolve_device() -> str:
@@ -112,22 +119,28 @@ def _load_model():
     if _MODEL is not None:
         return _MODEL, _PROCESSOR
 
-    import torch
-    from transformers import AutoImageProcessor, AutoModel
+    with _LOAD_LOCK:
+        # Re-check inside the lock — another thread may have loaded while
+        # we were waiting.
+        if _MODEL is not None:
+            return _MODEL, _PROCESSOR
 
-    model_id = settings.bridge_embedding_model
-    device = _resolve_device()
-    dtype = _resolve_dtype()
-    logger.info("embedding: loading model=%s device=%s dtype=%s",
-                model_id, device, dtype)
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
 
-    _PROCESSOR = AutoImageProcessor.from_pretrained(model_id)
-    _MODEL = AutoModel.from_pretrained(model_id, torch_dtype=dtype)
-    _MODEL.to(device)
-    _MODEL.eval()
+        model_id = settings.bridge_embedding_model
+        device = _resolve_device()
+        dtype = _resolve_dtype()
+        logger.info("embedding: loading model=%s device=%s dtype=%s",
+                    model_id, device, dtype)
 
-    logger.info("embedding: model loaded; dim=%d", embedding_dim())
-    return _MODEL, _PROCESSOR
+        _PROCESSOR = AutoImageProcessor.from_pretrained(model_id)
+        _MODEL = AutoModel.from_pretrained(model_id, torch_dtype=dtype)
+        _MODEL.to(device)
+        _MODEL.eval()
+
+        logger.info("embedding: model loaded; dim=%d", embedding_dim())
+        return _MODEL, _PROCESSOR
 
 
 def _encode_pil_batch(images: list[Image.Image]) -> np.ndarray:
