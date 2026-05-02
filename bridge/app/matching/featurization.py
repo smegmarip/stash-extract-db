@@ -104,6 +104,15 @@ async def _featurize_inner(job_id: str) -> None:
             except Exception as e:
                 logger.warning("featurize: B/C compute failed job=%s ref=%s :: %s", job_id, ref, e)
                 bc = {"color_hist": None, "tone": None}
+            # Channel D (semantic embedding) — gated by the feature flag.
+            # Same fetch the bc path uses; result cached in image_features
+            # under channel='embedding'. No baseline/uniqueness needed.
+            if settings.bridge_embedding_enabled:
+                try:
+                    from .image_match import extractor_image_embedding
+                    await extractor_image_embedding(job_id, ref)
+                except Exception as e:
+                    logger.warning("featurize: embedding compute failed job=%s ref=%s :: %s", job_id, ref, e)
         completed[0] += 1
         await cdb.set_feature_progress(job_id, 0.80 * (completed[0] / total))
         if h is not None:

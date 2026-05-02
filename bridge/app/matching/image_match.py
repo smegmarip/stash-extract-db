@@ -13,9 +13,12 @@ keyed by content fingerprint:
     within a snapshot).
 """
 import asyncio
+import io
 import logging
 from typing import Any, Optional
 from urllib.parse import urlparse, parse_qs
+
+from PIL import Image
 
 from ..stash import client as stash_client
 from ..extractor import client as ex_client
@@ -322,6 +325,163 @@ async def stash_cover_bc_features(
         "stash_cover", scene["id"], fingerprint,
         lambda: stash_client.fetch_image_bytes(url),
     )
+
+
+# --- Channel D: semantic embedding (DINOv2). See embedding.py for the
+# model + cosine math. Cache pattern mirrors B/C: read first, fetch +
+# encode on miss, write to image_features with channel='embedding'.
+
+async def _embedding_or_compute(
+    source: str, ref_id: str, fingerprint: str, fetcher,
+) -> Optional[bytes]:
+    """Read or compute the channel-D embedding for one image. Returns
+    the raw blob (fp16 vector serialized) or None on unrecoverable
+    failure (404, decode fail). Negative-cache sentinel writes prevent
+    repeat fetch attempts on the same dead ref.
+    """
+    from . import embedding as emb
+
+    if not fingerprint:
+        return None
+    algo = emb.algorithm_key()
+
+    cached = await cdb.get_image_feature(source, ref_id, fingerprint, "embedding", algo)
+    if cached is not None:
+        return bytes(cached[0])
+    if await cdb.is_feature_attempt_cached(source, ref_id, fingerprint, "embedding", algo):
+        return None
+
+    data = await fetcher()
+    if not data:
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "embedding", algo)
+        return None
+
+    vec = await emb.encode_bytes_async(data)
+    if vec is None:
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "embedding", algo)
+        return None
+
+    blob = emb.embedding_to_blob(vec)
+    # Quality field stores L2 norm — used at scoring time as an alternative
+    # to per-row normalization (we re-normalize in cosine_sim_matrix anyway,
+    # but keeping the norm available is cheap and useful for debug).
+    import numpy as _np
+    norm = float(_np.linalg.norm(vec.astype(_np.float32)))
+    await cdb.set_image_feature(
+        source, ref_id, fingerprint, "embedding", algo, blob, norm,
+    )
+    return blob
+
+
+async def extractor_image_embedding(job_id: str, ref: str) -> Optional[bytes]:
+    """Channel D embedding blob for one extractor image. None if
+    unfetchable / undecodeable / sentineled."""
+    if not ref:
+        return None
+    full_url = ex_client.resolve_asset_url(job_id, ref) if not ref.startswith("http") else ref
+    return await _embedding_or_compute(
+        "extractor_image", f"{job_id}:{ref}", full_url,
+        lambda: ex_client.fetch_asset(job_id, ref),
+    )
+
+
+async def stash_cover_embedding(scene: dict[str, Any]) -> Optional[bytes]:
+    """Channel D embedding for the scene's cover screenshot."""
+    paths = scene.get("paths") or {}
+    url = paths.get("screenshot") or ""
+    if not url:
+        return None
+    fingerprint = _screenshot_fingerprint(url) or url
+    return await _embedding_or_compute(
+        "stash_cover", scene["id"], fingerprint,
+        lambda: stash_client.fetch_image_bytes(url),
+    )
+
+
+async def stash_sprite_embeddings(
+    scene: dict[str, Any], sample_size: int,
+) -> list[Optional[bytes]]:
+    """Channel D embeddings per sprite frame. Returns a list of length
+    sample_size; entries may be None for frames whose decode/encode
+    failed. Cached per-frame at (`scene_id:idx`, oshash).
+
+    Mirrors stash_sprite_bc_features's structure: try cache first
+    per-frame, fall through to a single sprite fetch + per-frame batch
+    encode on miss.
+    """
+    from . import embedding as emb
+    from .imgmatch.sprite_processor import (
+        parse_vtt, decode_vtt_text, extract_sprite_frames, sample_frames,
+    )
+
+    paths = scene.get("paths") or {}
+    sprite_url = paths.get("sprite") or ""
+    vtt_url = paths.get("vtt") or ""
+    oshash = _scene_oshash(scene)
+    if not sprite_url or not vtt_url or not oshash:
+        return []
+
+    algo = emb.algorithm_key()
+
+    # Try cache per-frame.
+    out: list[Optional[bytes]] = []
+    cached_count = 0
+    sentinel_count = 0
+    for idx in range(sample_size):
+        ref_id = f"{scene['id']}:{idx}"
+        feat = await cdb.get_image_feature("stash_sprite", ref_id, oshash, "embedding", algo)
+        if feat is not None:
+            out.append(bytes(feat[0]))
+            cached_count += 1
+            continue
+        if await cdb.is_feature_attempt_cached("stash_sprite", ref_id, oshash, "embedding", algo):
+            out.append(None)
+            sentinel_count += 1
+            continue
+        # Real miss — break and fall through to compute.
+        out = []
+        break
+
+    if out and (cached_count + sentinel_count) == sample_size:
+        return out
+
+    # Cache miss — fetch sprite + VTT once, decode + encode all frames in batch.
+    sprite_bytes = await stash_client.fetch_image_bytes(sprite_url)
+    vtt_text = await stash_client.fetch_text(vtt_url)
+    if not sprite_bytes or not vtt_text:
+        return []
+
+    def _decode_and_sample():
+        sprite_img = Image.open(io.BytesIO(sprite_bytes))
+        vtt_frames = parse_vtt(decode_vtt_text(vtt_text))
+        if not vtt_frames:
+            return None
+        extracted = extract_sprite_frames(sprite_img, vtt_frames)
+        return sample_frames(extracted, sample_size)
+
+    try:
+        sampled = await asyncio.to_thread(_decode_and_sample)
+        if sampled is None:
+            return []
+    except Exception as e:
+        logger.warning("sprite embedding decode failed for scene %s :: %s", scene.get("id"), e)
+        return []
+
+    pil_frames = [s["image"] for s in sampled]
+    arr = await emb.encode_batch_async(pil_frames)   # (sample_size, D) fp16
+
+    out = []
+    for idx in range(len(sampled)):
+        ref_id = f"{scene['id']}:{idx}"
+        vec = arr[idx]
+        blob = emb.embedding_to_blob(vec)
+        import numpy as _np
+        norm = float(_np.linalg.norm(vec.astype(_np.float32)))
+        await cdb.set_image_feature(
+            "stash_sprite", ref_id, oshash, "embedding", algo, blob, norm,
+        )
+        out.append(blob)
+    return out
 
 
 async def stash_sprite_bc_features(
@@ -936,6 +1096,84 @@ async def score_image_channel_c(
     }
 
 
+async def score_image_channel_d(
+    scene: dict[str, Any],
+    job_id: str,
+    record: dict[str, Any],
+    image_mode: str,
+    sprite_sample_size: int,
+) -> dict[str, Any]:
+    """Channel D: semantic embedding (DINOv2). Cosine similarity in a
+    learned visual space. No baseline subtraction, no per-image c_i —
+    the embedding space is corpus-independent.
+
+    Pipeline:
+      1. Stack the record's per-image embeddings (cached from featurization).
+      2. Stack the scene's Stash-side embeddings (cover + N sprite frames
+         per image_mode), computing on-demand if not cached.
+      3. Cosine similarity matrix → per-extractor-image max → mean.
+
+    Returns a dict shaped like the other score_image_channel_* outputs
+    so it composes uniformly into score_image_composite.
+    """
+    from . import embedding as emb
+    import numpy as _np
+
+    # Extractor-side embeddings (cached from featurization).
+    refs: list[str] = list(record.get("images") or [])
+    cover = record.get("cover_image")
+    if cover and cover not in refs:
+        refs = [cover] + refs
+
+    extractor_blobs: list[bytes] = []
+    extractor_refs: list[str] = []
+    for ref in refs:
+        try:
+            blob = await extractor_image_embedding(job_id, ref)
+        except Exception as e:
+            logger.warning("score D: extractor embed failed job=%s ref=%s :: %s", job_id, ref, e)
+            blob = None
+        if blob is not None:
+            extractor_blobs.append(blob)
+            extractor_refs.append(ref)
+    N = len(extractor_blobs)
+
+    # Stash-side embeddings (computed on demand, cached after first call).
+    stash_blobs: list[bytes] = []
+    if image_mode in ("cover", "both"):
+        cb = await stash_cover_embedding(scene)
+        if cb is not None:
+            stash_blobs.append(cb)
+    if image_mode in ("sprite", "both"):
+        sprite_blobs = await stash_sprite_embeddings(scene, sprite_sample_size)
+        for sb in sprite_blobs:
+            if sb is not None:
+                stash_blobs.append(sb)
+    M = len(stash_blobs)
+
+    if N == 0 or M == 0:
+        return {
+            "S": 0.0, "per_image_max": [], "extractor_refs": extractor_refs,
+            "n_extractor_images": N, "n_stash_hashes": M,
+            "scoring": "embedding",
+        }
+
+    # Stack into matrices and run a single matmul (the whole point of
+    # this channel — replaces 1500+ Python iterations with one BLAS call).
+    extr_mat = _np.stack([emb.blob_to_embedding(b) for b in extractor_blobs])  # (N, D)
+    stash_mat = _np.stack([emb.blob_to_embedding(b) for b in stash_blobs])     # (M, D)
+    sims = emb.cosine_sim_matrix(stash_mat, extr_mat)                          # (M, N)
+
+    per_image_max = sims.max(axis=0).tolist()                                  # length N
+    S = float(sum(per_image_max) / len(per_image_max))                          # mean
+
+    return {
+        "S": S, "per_image_max": per_image_max, "extractor_refs": extractor_refs,
+        "n_extractor_images": N, "n_stash_hashes": M,
+        "scoring": "embedding",
+    }
+
+
 async def score_image_composite(
     scene: dict[str, Any],
     job_id: str,
@@ -991,6 +1229,18 @@ async def score_image_composite(
         channel_scores["tone"] = ChannelScore(
             S=c["S"], E=c["E"], count_conf=c["count_conf"],
             dist_q=c["dist_q"], m_primes=c["m_primes"],
+        )
+
+    if "embedding" in channels:
+        d = await score_image_channel_d(
+            scene, job_id, record, image_mode, sprite_sample_size,
+        )
+        per_channel_debug["embedding"] = d
+        # Embedding has no E/count_conf/dist_q — fill neutral values so
+        # the existing compose() math still works. S carries everything.
+        channel_scores["embedding"] = ChannelScore(
+            S=d["S"], E=0.0, count_conf=1.0, dist_q=1.0,
+            m_primes=d.get("per_image_max", []),
         )
 
     composite, fired = compose(channel_scores, min_contribution, bonus_per_extra)

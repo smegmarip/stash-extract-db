@@ -21,7 +21,7 @@ class MatchRequest(BaseModel):
     sprite_sample_size: Optional[int] = Field(default=None, ge=0)
     image_gamma: Optional[float] = Field(default=None, ge=0.5, le=8.0)
     image_count_k: Optional[float] = Field(default=None, gt=0.0)
-    image_channels: Optional[list[Literal["phash", "color_hist", "tone"]]] = None
+    image_channels: Optional[list[Literal["phash", "color_hist", "tone", "embedding"]]] = None
     image_min_contribution: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     image_bonus_per_extra: Optional[float] = Field(default=None, ge=0.0, le=1.0)
     image_search_floor: Optional[float] = Field(default=None, ge=0.0, le=1.0)

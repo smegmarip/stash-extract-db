@@ -33,6 +33,19 @@ class Settings(BaseSettings):
     bridge_image_channels: str = "phash,color_hist,tone"
     bridge_image_search_floor: Optional[float] = None  # mechanism shipped, default off (Run 6)
 
+    # --- Channel D: semantic embedding (DINOv2). Disabled by default.
+    # When enabled, featurization computes per-image embeddings using
+    # the configured model and stores them as image_features rows with
+    # channel='embedding'. Match-time scoring computes cosine similarity
+    # against cached extractor embeddings via a single matrix multiply.
+    # See docs/SEMANTIC_MIGRATION_PLAN.md.
+    bridge_embedding_enabled: bool = False
+    bridge_embedding_model: str = "facebook/dinov2-large"
+    bridge_embedding_device: str = "auto"        # auto | cuda | cpu
+    bridge_embedding_dtype: str = "fp16"         # fp16 | fp32
+    bridge_embedding_batch_size: int = 16
+    bridge_embedding_threshold: float = 0.7       # scrape-mode gate; cosine scale
+
     @property
     def image_channels(self) -> list[str]:
         return [c.strip() for c in self.bridge_image_channels.split(",") if c.strip()]
