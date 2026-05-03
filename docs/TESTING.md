@@ -19,8 +19,11 @@ tests/
 │   ├── test_lifecycle.py             # featurize_job, state machine, startup_recover, cascade re-enqueue,
 │   │                                 # event-loop responsiveness regression test (CLAUDE.md §14.4)
 │   ├── test_phase4_scoring_path.py   # end-to-end channel A score + 400 validation + legacy fallback
-│   └── test_phase5_multichannel.py   # channels B+C, composite, multi-channel validation,
-│                                     # SearchConfidenceFloor (CLAUDE.md §13.7)
+│   ├── test_phase5_multichannel.py   # channels B+C, composite, multi-channel validation,
+│   │                                 # SearchConfidenceFloor (CLAUDE.md §13.7)
+│   ├── test_embedding.py             # channel D math: cosine sim, fp16 blob round-trip,
+│   │                                 # algorithm-key versioning; GPU-skipped encode tests
+│   └── test_image_match_prefilter.py # D-batch + cached_channels plumbing (CLAUDE.md §13.10)
 ├── integration/
 │   └── test_calibration.py           # live harness that walks ground_truth.json against a running bridge
 └── calibration/
@@ -33,7 +36,7 @@ tests/
     └── runs/                         # gitignored — JSONL run-logs
 ```
 
-**98 unit tests pass in ~8 seconds**, with no external dependencies (no Stash, no extractor, no network). Run them on every change. The integration harness and calibration corpus are heavier — used for evaluating scoring quality, not for catching regressions in the inner code.
+The unit suite runs without external dependencies (no Stash, no extractor, no network). Run it on every change. Tests in `test_embedding.py::TestEncodeOnGPU` are auto-skipped when CUDA isn't available — they run only on the GPU host. The integration harness and calibration corpus are heavier — used for evaluating scoring quality, not for catching regressions in the inner code.
 
 ---
 
@@ -103,6 +106,27 @@ End-to-end exercises through the request pipeline:
 - The `IMAGE_SEARCH_FLOOR` mechanism (CLAUDE.md §13.7) drops weak candidates whose composite is below the floor; definitive signals (Studio+Code, Exact Title) bypass; `None` disables.
 
 These are the contract tests that protect against regressions at the `/match/*` API surface.
+
+### 2.7 `test_embedding.py`
+
+Channel D math from `bridge/app/matching/embedding.py`:
+
+- `cosine_sim` is symmetric, returns 1 for identical vectors, 0 for orthogonal, -1 for antiparallel, and 0 for zero-magnitude inputs (no NaN). fp16 inputs promote to fp32 internally so accumulation doesn't underflow.
+- `cosine_sim_matrix(S, E)` produces an `(M, N)` matrix with all entries in `[-1, 1]`; self-similarity diagonal is ~1.0; empty `S` returns a `(0, N)`-shaped result instead of erroring.
+- `embedding_to_blob` / `blob_to_embedding` round-trip preserves vectors at fp16 precision regardless of input dtype; serialized size is `dim × 2` bytes.
+- `algorithm_key()` formats as `<model>:<dtype>:<dim>` so a model swap creates rows under a fresh key without touching old ones.
+
+A separate `TestEncodeOnGPU` class (decorated `@pytest.mark.skipif(not _has_cuda())`) loads the configured model on the GPU host and asserts encoded shape + dtype on synthetic images. These run only where CUDA is available; on CPU-only dev they're skipped.
+
+### 2.8 `test_image_match_prefilter.py`
+
+D-batch and `cached_channels` plumbing from `bridge/app/matching/image_match.py` (CLAUDE.md §13.10):
+
+- `score_image_channel_d_batch` short-circuits to S=0 for every candidate when Stash side has no embeddings; same when no candidate has any extractor embeddings.
+- Per-candidate offsets align correctly under varying N_i across candidates: each candidate's `S` equals the mean of its own per-image-max sims (not bleed from neighbors in the stacked matrix). Candidate counts (`n_extractor_images`) are reported per candidate.
+- When `score_image_composite` is given a `cached_channels={"embedding": ...}`, the per-candidate `score_image_channel_d` is **not** called. This is the load-bearing invariant for the K>0 two-pass: A/B/C run lazily on top-K candidates while D's batch result is reused without recompute.
+
+Stubs the embedding-side helpers (`extractor_image_embedding`, `stash_cover_embedding`, `stash_sprite_embeddings`) directly so no DB or HTTP machinery is needed. Live end-to-end checks against a real job are handled by the smoke harness in `scripts/smoke_channel_d.py`.
 
 ---
 
@@ -188,8 +212,10 @@ The remaining 1 miss + 3 negative-control behaviors are outside the reach of any
 | Code change in DB schema or CRUD         | `pytest tests/unit/test_db.py`                   |
 | Code change in lifecycle / worker        | `pytest tests/unit/test_lifecycle.py`            |
 | Code change in `match.py` API surface    | `pytest tests/unit/test_phase4_scoring_path.py tests/unit/test_phase5_multichannel.py` |
-| Any code change                          | `pytest tests/unit/` (full suite, ~8 s)          |
-| Changing scoring defaults                | Re-run a calibration sweep, append to `CALIBRATION_RESULTS.md` (CLAUDE.md §13.10 don't) |
+| Code change in `embedding.py`            | `pytest tests/unit/test_embedding.py` (GPU-only encode tests auto-skip on CPU) |
+| Code change in D-batch / prefilter wiring | `pytest tests/unit/test_image_match_prefilter.py` |
+| Any code change                          | `pytest tests/unit/` (full suite)                |
+| Changing scoring defaults                | Re-run a calibration sweep, append to `CALIBRATION_RESULTS.md` (CLAUDE.md §13.11 don't) |
 | Suspicious match behavior in production  | Reproduce with `?debug=1` per `HOW_TO_USE.md` §5; if calibration suite has a cell that fits, re-run it |
 | Major refactor                           | Full unit suite + at least one calibration cell against the live bridge |
 

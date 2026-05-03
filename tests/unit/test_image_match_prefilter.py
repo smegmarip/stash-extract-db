@@ -1,4 +1,4 @@
-"""Unit tests for the Phase 2 prefilter wiring (per docs/SEMANTIC_PREFILTER_PLAN.md).
+"""Unit tests for the D-batch prefilter wiring (per CLAUDE.md §13.10).
 
 The two pieces under test are:
   - `score_image_channel_d_batch` — single-matmul scoring across N candidates

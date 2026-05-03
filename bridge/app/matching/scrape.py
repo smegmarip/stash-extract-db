@@ -78,7 +78,7 @@ async def scrape(
     #               for each candidate IS its D batch score. Fast path.
     # When `embedding` isn't in the channel list (or BRIDGE_EMBEDDING_ENABLED
     # is false), neither branch fires and we fall back to legacy single-pass.
-    # See docs/SEMANTIC_PREFILTER_PLAN.md.
+    # See CLAUDE.md §13.10 for the D-batch invariant.
     K = settings.bridge_embedding_prefilter_k
     use_d_batch = bool(
         use_multi

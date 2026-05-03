@@ -88,10 +88,10 @@ In Stash: **Settings → Scrapers → Reload Scrapers**. The bridge's scraper ap
 
 The scraper is a metadata transport: it reads a scene fragment from Stash on stdin, POSTs `{scene_id, mode}` to the bridge, returns the bridge's response. All scoring config lives on the bridge ([`CLAUDE.md`](../CLAUDE.md) §1). The scraper's `config.py` has only two settings:
 
-| Setting             | What it controls                            | Default                              |
-| ------------------- | ------------------------------------------- | ------------------------------------ |
-| `BRIDGE_URL`        | Where the scraper finds the bridge.         | `http://host.docker.internal:13000`  |
-| `REQUEST_TIMEOUT_S` | How long the scraper waits for the bridge. | `90`                                 |
+| Setting             | What it controls                           | Default                             |
+| ------------------- | ------------------------------------------ | ----------------------------------- |
+| `BRIDGE_URL`        | Where the scraper finds the bridge.        | `http://host.docker.internal:13000` |
+| `REQUEST_TIMEOUT_S` | How long the scraper waits for the bridge. | `90`                                |
 
 Changes take effect on the next scrape — no Stash reload needed.
 
@@ -192,13 +192,17 @@ You get a per-candidate breakdown:
         "have_stash": true,
         "have_extractor": true
       },
-      "tone": { /* same shape as phash */ }
+      "tone": {
+        /* same shape as phash */
+      }
     },
     "fired": ["phash", "color_hist"],
     "composite": 0.81
   },
   "image_contribution": 0.81,
-  "filename": { /* ... */ },
+  "filename": {
+    /* ... */
+  },
   "raw_score": 1.94,
   "capped_score": 1.0
 }
@@ -350,77 +354,77 @@ After this, you cannot re-enable the legacy path — the dual-write code is stil
 
 For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the symptom→file map for the matching engine itself.
 
-| Symptom                                       | First place to check                                                                                                                       |
-| --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `/health` returns nothing                     | `docker compose logs stash-extract-db` — usually a Stash or extractor URL misconfig.                                                      |
-| Stash dialog empty for a scene                | §4.2 direct curl. Does the bridge return `[]`, an empty `{}`, or a 503/400?                                                                |
-| Wrong record returned                         | §5 `?debug=1` to inspect which formula component is misbehaving. Calibrated values are bridge-internal — empirical regressions are calibration bugs, not deploy-time knobs.                          |
-| `503` errors in Stash log during batch scrape | Expected during first featurization wave. See CLAUDE.md §14.8.                                                                            |
-| Featurization stuck at `progress: 0`          | Bridge restart didn't see the row as stale yet — wait `BRIDGE_STALE_TASK_MS` (default 10 min), or manually delete the `job_feature_state` row. |
-| Scoring same scene differently after restart  | `corpus_stats` regenerated — baseline shifts slightly. Expected; absolute scores not stable across re-featurization, but ranks should be. |
-| Bridge unresponsive (`/health` timing out) during heavy work | Possible regression of the asyncio.to_thread fix — see CLAUDE.md §14.4. Run `pytest tests/unit/test_lifecycle.py::TestEventLoopResponsiveness`. |
-| Need to nuke everything and start fresh      | `docker compose down -v` won't delete `./data/`. Do `rm -rf ./data && docker compose up -d --build`.                                       |
+| Symptom                                                      | First place to check                                                                                                                                                        |
+| ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/health` returns nothing                                    | `docker compose logs stash-extract-db` — usually a Stash or extractor URL misconfig.                                                                                        |
+| Stash dialog empty for a scene                               | §4.2 direct curl. Does the bridge return `[]`, an empty `{}`, or a 503/400?                                                                                                 |
+| Wrong record returned                                        | §5 `?debug=1` to inspect which formula component is misbehaving. Calibrated values are bridge-internal — empirical regressions are calibration bugs, not deploy-time knobs. |
+| `503` errors in Stash log during batch scrape                | Expected during first featurization wave. See CLAUDE.md §14.8.                                                                                                              |
+| Featurization stuck at `progress: 0`                         | Bridge restart didn't see the row as stale yet — wait `BRIDGE_STALE_TASK_MS` (default 10 min), or manually delete the `job_feature_state` row.                              |
+| Scoring same scene differently after restart                 | `corpus_stats` regenerated — baseline shifts slightly. Expected; absolute scores not stable across re-featurization, but ranks should be.                                   |
+| Bridge unresponsive (`/health` timing out) during heavy work | Possible regression of the asyncio.to_thread fix — see CLAUDE.md §14.4. Run `pytest tests/unit/test_lifecycle.py::TestEventLoopResponsiveness`.                             |
+| Need to nuke everything and start fresh                      | `docker compose down -v` won't delete `./data/`. Do `rm -rf ./data && docker compose up -d --build`.                                                                        |
 
 ---
 
 ## 9. Environment variable reference
 
-Every environment variable consumed by the bridge or `docker-compose.yml`, in two groups: **operational** (depends on hardware / deployment, edit per-deploy) and **calibrated** (depends on corpus characteristics, do not edit without empirical evidence). Both live in the same `.env` file — re-calibration *is* configuration; treating them differently was the mistake the earlier design made.
+Every environment variable consumed by the bridge or `docker-compose.yml`, in two groups: **operational** (depends on hardware / deployment, edit per-deploy) and **calibrated** (depends on corpus characteristics, do not edit without empirical evidence). Both live in the same `.env` file — re-calibration _is_ configuration; treating them differently was the mistake the earlier design made.
 
 ### 9.1 Operational — deployment-time
 
-| Variable                                  | Default                              | Purpose                                                                                                                                       |
-| ----------------------------------------- | ------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `BRIDGE_PORT` *(compose)*                 | `13000`                              | Host port that maps to the bridge container's 13000.                                                                                          |
-| `DATA_PATH` *(compose)*                   | `./data`                             | Host directory bind-mounted at `/data` in the container. Holds the SQLite cache.                                                              |
-| `DOCKER_NETWORK` *(compose)*              | `extractor_network`                  | External Docker network name. Bridge attaches to it to talk to the extractor.                                                                 |
-| `STASH_URL`                               | `http://host.docker.internal:9999`   | Where Stash is reachable from inside the bridge container.                                                                                    |
-| `STASH_API_KEY`                           | *(empty)*                            | Stash API key, if auth is enabled. Use this OR session cookie, not both.                                                                      |
-| `STASH_SESSION_COOKIE`                    | *(empty)*                            | Stash session cookie, alternative to API key.                                                                                                 |
-| `EXTRACTOR_URL`                           | `http://extractor-gateway:12000`     | Where the site-extractor is reachable. Defaults work when both containers share `extractor_network`.                                          |
-| `DATA_DIR`                                | `/data`                              | Path inside the container where the SQLite cache lives. Don't change unless you also rewrite the bind mount.                                  |
-| `LOG_LEVEL`                               | `INFO`                               | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                    |
-| `BRIDGE_LIFECYCLE_ENABLED`                | `true`                               | Master toggle for eager featurization + 503 request gate. Set `false` only as a rollback to the legacy single-channel path (§7.2).            |
-| `BRIDGE_NEW_SCORING_ENABLED`              | `true`                               | Master toggle for the multi-channel scoring formula. Set `false` to revert to the legacy top-K-mean (§7.1).                                   |
-| `BRIDGE_FEATURIZE_CONCURRENCY`            | `4`                                  | Worker pool size — bounds parallel featurization across jobs. Lower if the extractor saturates.                                               |
-| `BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY`    | `8`                                  | Per-job parallel asset fetches. Lower if a single big job is too aggressive on the extractor.                                                 |
-| `BRIDGE_STALE_TASK_MS`                    | `600000` (10 min)                    | A `featurizing` row whose `started_at` is older than this is treated as stuck on boot and re-enqueued.                                        |
-| `BRIDGE_STASH_FEATURE_BUDGET_BYTES`       | `1073741824` (1 GB)                  | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU.  |
-| `BRIDGE_LRU_EVICTION_INTERVAL_S`          | `3600` (1 hour)                      | How often the LRU eviction loop runs.                                                                                                         |
-| `BRIDGE_LEGACY_DUAL_WRITE_ENABLED`        | `true`                               | While `true`, every pHash compute writes to both `image_hashes` (legacy) and `image_features`; reads check features first, fall back to legacy. Flip `false` to retire the legacy path (§7.3). |
+| Variable                               | Default                            | Purpose                                                                                                                                                                                        |
+| -------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BRIDGE_PORT` _(compose)_              | `13000`                            | Host port that maps to the bridge container's 13000.                                                                                                                                           |
+| `DATA_PATH` _(compose)_                | `./data`                           | Host directory bind-mounted at `/data` in the container. Holds the SQLite cache.                                                                                                               |
+| `DOCKER_NETWORK` _(compose)_           | `extractor_network`                | External Docker network name. Bridge attaches to it to talk to the extractor.                                                                                                                  |
+| `STASH_URL`                            | `http://host.docker.internal:9999` | Where Stash is reachable from inside the bridge container.                                                                                                                                     |
+| `STASH_API_KEY`                        | _(empty)_                          | Stash API key, if auth is enabled. Use this OR session cookie, not both.                                                                                                                       |
+| `STASH_SESSION_COOKIE`                 | _(empty)_                          | Stash session cookie, alternative to API key.                                                                                                                                                  |
+| `EXTRACTOR_URL`                        | `http://extractor-gateway:12000`   | Where the site-extractor is reachable. Defaults work when both containers share `extractor_network`.                                                                                           |
+| `DATA_DIR`                             | `/data`                            | Path inside the container where the SQLite cache lives. Don't change unless you also rewrite the bind mount.                                                                                   |
+| `LOG_LEVEL`                            | `INFO`                             | Python logging level: `DEBUG`, `INFO`, `WARNING`, `ERROR`.                                                                                                                                     |
+| `BRIDGE_LIFECYCLE_ENABLED`             | `true`                             | Master toggle for eager featurization + 503 request gate. Set `false` only as a rollback to the legacy single-channel path (§7.2).                                                             |
+| `BRIDGE_NEW_SCORING_ENABLED`           | `true`                             | Master toggle for the multi-channel scoring formula. Set `false` to revert to the legacy top-K-mean (§7.1).                                                                                    |
+| `BRIDGE_FEATURIZE_CONCURRENCY`         | `4`                                | Worker pool size — bounds parallel featurization across jobs. Lower if the extractor saturates.                                                                                                |
+| `BRIDGE_FEATURIZE_PER_JOB_CONCURRENCY` | `8`                                | Per-job parallel asset fetches. Lower if a single big job is too aggressive on the extractor.                                                                                                  |
+| `BRIDGE_STALE_TASK_MS`                 | `600000` (10 min)                  | A `featurizing` row whose `started_at` is older than this is treated as stuck on boot and re-enqueued.                                                                                         |
+| `BRIDGE_STASH_FEATURE_BUDGET_BYTES`    | `1073741824` (1 GB)                | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU.                                                   |
+| `BRIDGE_LRU_EVICTION_INTERVAL_S`       | `3600` (1 hour)                    | How often the LRU eviction loop runs.                                                                                                                                                          |
+| `BRIDGE_LEGACY_DUAL_WRITE_ENABLED`     | `true`                             | While `true`, every pHash compute writes to both `image_hashes` (legacy) and `image_features`; reads check features first, fall back to legacy. Flip `false` to retire the legacy path (§7.3). |
 
 ### 9.2 Calibrated — empirically derived, change with evidence
 
 These are the bridge's calibrated behavior, sourced from a 491-video Pexels corpus sweep (see [`calibration/CALIBRATION_RESULTS.md`](calibration/CALIBRATION_RESULTS.md)). Re-calibrating against a different corpus = re-run the sweep harness and update these values. Don't tune them without data.
 
-| Variable                                       | Default                       | Source / purpose                                                                                                                                       |
-| ---------------------------------------------- | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `BRIDGE_HASH_ALGORITHM`                        | `phash`                       | Hash algorithm. Used by featurization AND per-request matching — single value.                                                                          |
-| `BRIDGE_HASH_SIZE`                             | `16`                          | Hash bit size. Used by featurization AND per-request matching.                                                                                          |
-| `BRIDGE_IMAGE_MODE`                            | `cover`                       | `cover` / `sprite` / `both`. Cover is fastest; `both` is most accurate but slow.                                                                        |
-| `BRIDGE_IMAGE_THRESHOLD`                       | `0.7`                         | Composite gate for scrape mode. Search mode is unaffected.                                                                                              |
-| `BRIDGE_SEARCH_LIMIT`                          | `5`                           | Top-N for search mode.                                                                                                                                  |
-| `BRIDGE_SPRITE_SAMPLE_SIZE`                    | `8`                           | Sprite frames sampled per scene in `sprite`/`both` modes.                                                                                               |
-| `BRIDGE_IMAGE_GAMMA`                           | `3.5`                         | Sharpening exponent on per-image similarities. **Run 3a peak** (concave; γ=2.0 lost 27 points to γ=3.5).                                               |
-| `BRIDGE_IMAGE_COUNT_K`                         | `0.25`                        | Count saturation `k` in `1 - exp(-Σw / k)`. **Run 3c peak** (sparse-N records were systematically under-weighted at k=2.0).                            |
-| `BRIDGE_IMAGE_MIN_CONTRIBUTION`                | `0.05`                        | A channel's S must clear this to count as "fired" for the bonus. **Run 3b peak** (higher excludes weak-but-correct contributions too aggressively).    |
-| `BRIDGE_IMAGE_BONUS_PER_EXTRA`                 | `0.1`                         | Bonus added per additional firing channel.                                                                                                              |
-| `BRIDGE_IMAGE_CHANNELS`                        | `phash,color_hist,tone`       | Comma-separated channel list. Drop `tone` for ~33% per-query speedup on Pexels-style mixed content (Run 7 found tone is silenced via uniqueness collapse there). |
-| `BRIDGE_IMAGE_SEARCH_FLOOR`                    | *(unset → disabled)*          | Optional search-mode confidence floor. **Run 6** found no global value separates weak-correct from weak-incorrect on the Pexels corpus; sharper-corpus deployments may set 0.10–0.20. |
-| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA`            | `1.0`                         | Smoothing factor in `c_i = 1 / (1 + α·matches)`. **Run 5b flat** — varying didn't help.                                                                |
-| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD`        | `0.85`                        | Similarity threshold above which two record images count as a near-duplicate for `c_i`. **Run 5a peak** (concave, both directions degrade).            |
-| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH`  | *(unset → inherits global)*   | Per-channel override. **Run 7** confirmed defaults are optimal on Pexels; useful only for corpora where one channel needs distinct tuning.             |
-| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE`   | *(unset → inherits global)*   | Per-channel override for tone. Counterintuitively, lifting this above the global *hurts* on natural-scene corpora (Run 7).                              |
-| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH`      | *(unset → inherits global)*   | Per-channel α override for pHash.                                                                                                                       |
-| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE`       | *(unset → inherits global)*   | Per-channel α override for tone.                                                                                                                        |
-| `BRIDGE_EMBEDDING_ENABLED`                     | `false`                       | Channel D (DINOv2 semantic embedding). Disabled by default; flip to `true` and add `embedding` to `BRIDGE_IMAGE_CHANNELS` to engage. See §10.            |
-| `BRIDGE_EMBEDDING_MODEL`                       | `facebook/dinov2-large`       | HuggingFace model id. Determines embedding dim + algorithm string. Common alternatives: `facebook/dinov2-base` (faster, 768-dim), `facebook/dinov2-giant` (best, 1536-dim, ~10GB VRAM). |
-| `BRIDGE_EMBEDDING_DEVICE`                      | `auto`                        | `auto` / `cuda` / `cpu`. `auto` picks CUDA if available, else CPU.                                                                                       |
-| `BRIDGE_EMBEDDING_DTYPE`                       | `fp16`                        | `fp16` / `fp32`. fp16 halves VRAM and is faster on Ampere+ GPUs (A4000). Forced to fp32 when running on CPU.                                            |
-| `BRIDGE_EMBEDDING_BATCH_SIZE`                  | `16`                          | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                |
-| `BRIDGE_EMBEDDING_THRESHOLD`                   | `0.7`                         | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                |
-| `BRIDGE_EMBEDDING_PREFILTER_K`                 | `10`                          | `K>0`: two-pass — D ranks all candidates in one matmul, A/B/C re-score top-K. `K=0`: embedding-only — A/B/C compute skipped entirely (fastest). See §10.5. |
-| `DOCKER_RUNTIME` *(compose)*                   | `nvidia`                      | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).             |
+| Variable                                      | Default                     | Source / purpose                                                                                                                                                                        |
+| --------------------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `BRIDGE_HASH_ALGORITHM`                       | `phash`                     | Hash algorithm. Used by featurization AND per-request matching — single value.                                                                                                          |
+| `BRIDGE_HASH_SIZE`                            | `16`                        | Hash bit size. Used by featurization AND per-request matching.                                                                                                                          |
+| `BRIDGE_IMAGE_MODE`                           | `cover`                     | `cover` / `sprite` / `both`. Cover is fastest; `both` is most accurate but slow.                                                                                                        |
+| `BRIDGE_IMAGE_THRESHOLD`                      | `0.7`                       | Composite gate for scrape mode. Search mode is unaffected.                                                                                                                              |
+| `BRIDGE_SEARCH_LIMIT`                         | `5`                         | Top-N for search mode.                                                                                                                                                                  |
+| `BRIDGE_SPRITE_SAMPLE_SIZE`                   | `8`                         | Sprite frames sampled per scene in `sprite`/`both` modes.                                                                                                                               |
+| `BRIDGE_IMAGE_GAMMA`                          | `3.5`                       | Sharpening exponent on per-image similarities. **Run 3a peak** (concave; γ=2.0 lost 27 points to γ=3.5).                                                                                |
+| `BRIDGE_IMAGE_COUNT_K`                        | `0.25`                      | Count saturation `k` in `1 - exp(-Σw / k)`. **Run 3c peak** (sparse-N records were systematically under-weighted at k=2.0).                                                             |
+| `BRIDGE_IMAGE_MIN_CONTRIBUTION`               | `0.05`                      | A channel's S must clear this to count as "fired" for the bonus. **Run 3b peak** (higher excludes weak-but-correct contributions too aggressively).                                     |
+| `BRIDGE_IMAGE_BONUS_PER_EXTRA`                | `0.1`                       | Bonus added per additional firing channel.                                                                                                                                              |
+| `BRIDGE_IMAGE_CHANNELS`                       | `phash,color_hist,tone`     | Comma-separated channel list. Drop `tone` for ~33% per-query speedup on Pexels-style mixed content (Run 7 found tone is silenced via uniqueness collapse there).                        |
+| `BRIDGE_IMAGE_SEARCH_FLOOR`                   | _(unset → disabled)_        | Optional search-mode confidence floor. **Run 6** found no global value separates weak-correct from weak-incorrect on the Pexels corpus; sharper-corpus deployments may set 0.10–0.20.   |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA`           | `1.0`                       | Smoothing factor in `c_i = 1 / (1 + α·matches)`. **Run 5b flat** — varying didn't help.                                                                                                 |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD`       | `0.85`                      | Similarity threshold above which two record images count as a near-duplicate for `c_i`. **Run 5a peak** (concave, both directions degrade).                                             |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_PHASH` | _(unset → inherits global)_ | Per-channel override. **Run 7** confirmed defaults are optimal on Pexels; useful only for corpora where one channel needs distinct tuning.                                              |
+| `BRIDGE_FEATURIZE_UNIQUENESS_THRESHOLD_TONE`  | _(unset → inherits global)_ | Per-channel override for tone. Counterintuitively, lifting this above the global _hurts_ on natural-scene corpora (Run 7).                                                              |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_PHASH`     | _(unset → inherits global)_ | Per-channel α override for pHash.                                                                                                                                                       |
+| `BRIDGE_FEATURIZE_UNIQUENESS_ALPHA_TONE`      | _(unset → inherits global)_ | Per-channel α override for tone.                                                                                                                                                        |
+| `BRIDGE_EMBEDDING_ENABLED`                    | `false`                     | Channel D (DINOv2 semantic embedding). Disabled by default; flip to `true` and add `embedding` to `BRIDGE_IMAGE_CHANNELS` to engage. See §10.                                           |
+| `BRIDGE_EMBEDDING_MODEL`                      | `facebook/dinov2-large`     | HuggingFace model id. Determines embedding dim + algorithm string. Common alternatives: `facebook/dinov2-base` (faster, 768-dim), `facebook/dinov2-giant` (best, 1536-dim, ~10GB VRAM). |
+| `BRIDGE_EMBEDDING_DEVICE`                     | `auto`                      | `auto` / `cuda` / `cpu`. `auto` picks CUDA if available, else CPU.                                                                                                                      |
+| `BRIDGE_EMBEDDING_DTYPE`                      | `fp16`                      | `fp16` / `fp32`. fp16 halves VRAM and is faster on Ampere+ GPUs (A4000). Forced to fp32 when running on CPU.                                                                            |
+| `BRIDGE_EMBEDDING_BATCH_SIZE`                 | `16`                        | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                                               |
+| `BRIDGE_EMBEDDING_THRESHOLD`                  | `0.7`                       | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                                               |
+| `BRIDGE_EMBEDDING_PREFILTER_K`                | `10`                        | `K>0`: two-pass — D ranks all candidates in one matmul, A/B/C re-score top-K. `K=0`: embedding-only — A/B/C compute skipped entirely (fastest). See §10.5.                              |
+| `DOCKER_RUNTIME` _(compose)_                  | `nvidia`                    | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).                                            |
 
 ### 9.3 Why "calibrated" is still in env, not Python code
 
@@ -432,7 +436,7 @@ Earlier iterations of this doc argued these values should be hidden inside `brid
 
 For corpora where pHash + color_hist + tone produce weak signals (low-resolution video, content that differs structurally from the calibration set), the bridge supports a fourth scoring channel using a learned visual embedding model. Cosine similarity in DINOv2's embedding space approximates semantic similarity — "do these two images depict the same scene" — independent of corpus characteristics.
 
-See [`SEMANTIC_MIGRATION_PLAN.md`](SEMANTIC_MIGRATION_PLAN.md) for the architectural rationale.
+See [`CLAUDE.md`](../CLAUDE.md) §13.10 for the architectural invariants.
 
 ### 10.1 Activation
 
@@ -496,11 +500,13 @@ When `BRIDGE_IMAGE_CHANNELS` includes `embedding` AND `BRIDGE_EMBEDDING_ENABLED=
 - **`K == 0` — embedding-only**: every candidate's image score IS its D batch score. A/B/C compute is skipped entirely. Fastest path; same scoring behavior as Phase 1's embedding-only default.
 
 Choose K based on the trade you want:
+
 - `K=0` for pure speed; accept D's concept-only failures.
 - `K=10` (default) for a comfortable ~500-record corpus; A/B/C re-rank work is bounded.
 - `K=50` for ~10K corpora; `K=100` for ~100K.
 
 Inspect log lines to confirm which path is engaged:
+
 - `scoring=multi+prefilter` → two-pass
 - `scoring=multi+d_only` → K=0 embedding-only
 

@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     # the configured model and stores them as image_features rows with
     # channel='embedding'. Match-time scoring computes cosine similarity
     # against cached extractor embeddings via a single matrix multiply.
-    # See docs/SEMANTIC_MIGRATION_PLAN.md.
+    # See CLAUDE.md §13.10 for invariants.
     bridge_embedding_enabled: bool = False
     bridge_embedding_model: str = "facebook/dinov2-large"
     bridge_embedding_device: str = "auto"        # auto | cuda | cpu
@@ -51,10 +51,10 @@ class Settings(BaseSettings):
     #             A/B/C re-score only the top-K. Composite combines via
     #             §13.3 max+bonus. Catches D's concept-only failure mode.
     #   K == 0  →  embedding-only: D ranks all, A/B/C compute is skipped
-    #             entirely. Fastest path, same as Phase 1 default.
-    # When D isn't in the channel list, K is ignored (legacy single-pass
-    # over all candidates with whatever channels are present).
-    # See docs/SEMANTIC_PREFILTER_PLAN.md.
+    #             entirely. Fastest path.
+    # When D isn't in the channel list, K is ignored (single-pass over
+    # all candidates with whatever channels are present).
+    # See CLAUDE.md §13.10 for the D-batch invariant.
     bridge_embedding_prefilter_k: int = 10
 
     @property

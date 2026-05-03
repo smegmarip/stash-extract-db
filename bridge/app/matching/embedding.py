@@ -10,8 +10,7 @@ Stored in `image_features` with channel='embedding' and a versioned
 `algorithm` string ('<model>:<dtype>:<dim>'). Cascade invalidation,
 LRU eviction, and dual-write retirement carry over without change.
 
-See docs/SEMANTIC_MIGRATION_PLAN.md for the architecture rationale and
-phasing.
+See CLAUDE.md §13.10 for the channel-D invariants.
 """
 from __future__ import annotations
 
