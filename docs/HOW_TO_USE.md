@@ -419,7 +419,7 @@ These are the bridge's calibrated behavior, sourced from a 491-video Pexels corp
 | `BRIDGE_EMBEDDING_DTYPE`                       | `fp16`                        | `fp16` / `fp32`. fp16 halves VRAM and is faster on Ampere+ GPUs (A4000). Forced to fp32 when running on CPU.                                            |
 | `BRIDGE_EMBEDDING_BATCH_SIZE`                  | `16`                          | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                |
 | `BRIDGE_EMBEDDING_THRESHOLD`                   | `0.7`                         | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                |
-| `BRIDGE_EMBEDDING_PREFILTER_K`                 | `10`                          | Two-pass matching: D ranks all candidates in one matmul, then A/B/C re-score only the top-K (default 10). Total cost stays at ~17s warm regardless of corpus size, vs ~50–99s for single-pass A/B/C. Set `0` to disable two-pass. See §10.5. |
+| `BRIDGE_EMBEDDING_PREFILTER_K`                 | `10`                          | `K>0`: two-pass — D ranks all candidates in one matmul, A/B/C re-score top-K. `K=0`: embedding-only — A/B/C compute skipped entirely (fastest). See §10.5. |
 | `DOCKER_RUNTIME` *(compose)*                   | `nvidia`                      | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).             |
 
 ### 9.3 Why "calibrated" is still in env, not Python code
@@ -488,13 +488,20 @@ curl -s -X POST 'http://localhost:13000/match/fragment?debug=1' \
 
 You should see `S` (cosine mean), `per_image_max` (per-record-image best cosines), `n_extractor_images`, `n_stash_hashes`. If `n_extractor_images=0`, the record's embeddings haven't been featurized yet (check `/api/featurization/status`). If `n_stash_hashes=0`, the Stash side couldn't fetch sprite/cover; check the bridge logs.
 
-### 10.5 Two-pass matching (D pre-filter → A/B/C re-rank top-K)
+### 10.5 D-batch + (optional) A/B/C re-rank — `BRIDGE_EMBEDDING_PREFILTER_K`
 
-When `BRIDGE_IMAGE_CHANNELS` includes `embedding` AND `BRIDGE_EMBEDDING_ENABLED=true` AND `BRIDGE_EMBEDDING_PREFILTER_K > 0`, image scoring runs in two passes:
+When `BRIDGE_IMAGE_CHANNELS` includes `embedding` AND `BRIDGE_EMBEDDING_ENABLED=true`, the request hot path runs a single D-batch matmul over every candidate (~ms regardless of corpus size) and then dispatches based on `K`:
 
-1. **D over all candidates** in one matmul (~ms regardless of corpus size). Sort, take top-K.
-2. **A/B/C over those K** (default K=10). Combined via the existing `max(fired) + bonus * (n_fired - 1)` composite formula, with D's pass-1 score reused (no recompute).
+- **`K > 0` — two-pass**: take the top-K candidates by D score, run A/B/C over those K, combine via the existing `max(fired) + bonus * (n_fired - 1)` composite. Catches D's concept-only failure mode (a wrong specific video that D ranks confidently because it shares the matched concept; A/B/C's color histogram + pHash discriminate on the specific frame and the corroboration bonus elevates the right candidate).
+- **`K == 0` — embedding-only**: every candidate's image score IS its D batch score. A/B/C compute is skipped entirely. Fastest path; same scoring behavior as Phase 1's embedding-only default.
 
-This is the production scoring path when channel D is active. Total per-request cost stays under the Stash 90s scrape timeout: ~17s on a corpus of any size, vs ~50–99s for single-pass A/B/C across thousands of candidates. Set `BRIDGE_EMBEDDING_PREFILTER_K=0` to disable the prefilter and fall back to single-pass scoring across every candidate (only viable when A/B/C cost stays within timeout budget).
+Choose K based on the trade you want:
+- `K=0` for pure speed; accept D's concept-only failures.
+- `K=10` (default) for a comfortable ~500-record corpus; A/B/C re-rank work is bounded.
+- `K=50` for ~10K corpora; `K=100` for ~100K.
 
-K should grow roughly with corpus size: 10 is comfortable for ~500 records, ~50 for ~10K, ~100 for ~100K. Larger K means more A/B/C work but better corroboration coverage. Inspect `?debug=1` log lines (`scrape: tier=image scoring=multi+prefilter ... n=N (scored=K)`) to confirm the two-pass is engaging.
+Inspect log lines to confirm which path is engaged:
+- `scoring=multi+prefilter` → two-pass
+- `scoring=multi+d_only` → K=0 embedding-only
+
+When `embedding` is not in `BRIDGE_IMAGE_CHANNELS`, K is ignored and the legacy single-pass A/B/C path runs across every candidate. That path scales with corpus size (each candidate gets per-image hash compute) and is only viable when total cost stays under your scrape timeout budget.

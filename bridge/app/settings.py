@@ -45,13 +45,16 @@ class Settings(BaseSettings):
     bridge_embedding_dtype: str = "fp16"         # fp16 | fp32
     bridge_embedding_batch_size: int = 16
     bridge_embedding_threshold: float = 0.7       # scrape-mode gate; cosine scale
-    # Two-pass matching: D ranks all candidates in one matmul, then A/B/C
-    # re-score only the top-K survivors (the §13 composite formula combines
-    # them). Total cost stays at the embedding-only level (~ms for D + a
-    # bounded amount of A/B/C work on K candidates) while preserving the
-    # corroboration bonus that catches D's concept-only failure mode. See
-    # docs/SEMANTIC_PREFILTER_PLAN.md. Set to 0 to disable two-pass; the
-    # composite is computed against every candidate (legacy single-pass).
+    # D-batch + (optional) A/B/C re-rank knob. Two regimes when D is in
+    # BRIDGE_IMAGE_CHANNELS AND BRIDGE_EMBEDDING_ENABLED=true:
+    #   K  > 0  →  two-pass: D ranks all candidates in one matmul, then
+    #             A/B/C re-score only the top-K. Composite combines via
+    #             §13.3 max+bonus. Catches D's concept-only failure mode.
+    #   K == 0  →  embedding-only: D ranks all, A/B/C compute is skipped
+    #             entirely. Fastest path, same as Phase 1 default.
+    # When D isn't in the channel list, K is ignored (legacy single-pass
+    # over all candidates with whatever channels are present).
+    # See docs/SEMANTIC_PREFILTER_PLAN.md.
     bridge_embedding_prefilter_k: int = 10
 
     @property

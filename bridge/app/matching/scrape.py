@@ -70,48 +70,61 @@ async def scrape(
     use_multi = bool(use_new and image_channels and len(image_channels) >= 1
                      and set(image_channels) != {"phash"})
 
-    # Two-pass: D batch-ranks all candidates in one matmul, then A/B/C
-    # re-score only the top-K survivors. Disabled when D isn't in the
-    # channel list, when embedding is globally off, or when K=0.
+    # D-batch + (optional) A/B/C re-rank. Two distinct knobs collapse onto
+    # one `K`:
+    #   - K  > 0  →  two-pass: D ranks all, A/B/C re-score top-K, composite
+    #               combines via §13.3 max+bonus formula.
+    #   - K == 0  →  embedding-only: D ranks all, no A/B/C compute, score
+    #               for each candidate IS its D batch score. Fast path.
+    # When `embedding` isn't in the channel list (or BRIDGE_EMBEDDING_ENABLED
+    # is false), neither branch fires and we fall back to legacy single-pass.
     # See docs/SEMANTIC_PREFILTER_PLAN.md.
     K = settings.bridge_embedding_prefilter_k
-    use_two_pass = bool(
+    use_d_batch = bool(
         use_multi
         and image_channels and "embedding" in image_channels
         and settings.bridge_embedding_enabled
-        and K > 0
-        and K < n_cand
     )
+    use_abc_rerank = use_d_batch and K > 0 and K < n_cand
+    d_results: dict[tuple[str, int], dict[str, Any]] = {}
     cands_to_score = candidates
     cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
-    if use_two_pass:
+    if use_d_batch:
         d_results = await score_image_channel_d_batch(
             scene, candidates, image_mode, sprite_sample_size,
         )
-        # Sort all candidates by D score desc; take top K. Tiebreak by
-        # (job_id, result_index) for determinism per CLAUDE.md §10.
-        ranked = sorted(
-            candidates,
-            key=lambda c: (
-                -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
-                c["job_id"], c["result_index"],
-            ),
-        )
-        cands_to_score = ranked[:K]
-        cached_d_per_cand = {
-            (c["job_id"], c["result_index"]): {
-                "embedding": d_results[(c["job_id"], c["result_index"])]
+        if use_abc_rerank:
+            # Sort all candidates by D score desc; take top K. Tiebreak by
+            # (job_id, result_index) for determinism per CLAUDE.md §10.
+            ranked = sorted(
+                candidates,
+                key=lambda c: (
+                    -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
+                    c["job_id"], c["result_index"],
+                ),
+            )
+            cands_to_score = ranked[:K]
+            cached_d_per_cand = {
+                (c["job_id"], c["result_index"]): {
+                    "embedding": d_results[(c["job_id"], c["result_index"])]
+                }
+                for c in cands_to_score
             }
-            for c in cands_to_score
-        }
-        logger.info(
-            "scrape: tier=image two-pass D-batch n=%d → top_k=%d",
-            n_cand, len(cands_to_score),
-        )
+            logger.info(
+                "scrape: tier=image two-pass D-batch n=%d → A/B/C re-rank top_k=%d",
+                n_cand, len(cands_to_score),
+            )
+        else:
+            logger.info(
+                "scrape: tier=image embedding-only D-batch n=%d (K=0, A/B/C skipped)",
+                n_cand,
+            )
 
     scoring_path = "multi" if use_multi else ("channel_a" if use_new else "legacy")
-    if use_two_pass:
+    if use_abc_rerank:
         scoring_path += "+prefilter"
+    elif use_d_batch:
+        scoring_path += "+d_only"
     logger.info(
         "scrape: tier=image scoring=%s mode=%s threshold=%.3f n=%d (scored=%d)",
         scoring_path, image_mode, threshold, n_cand, len(cands_to_score),
@@ -121,17 +134,24 @@ async def scrape(
     raw_top: tuple[float, str, int] = (0.0, "", -1)  # (best raw composite, job, idx)
     for c in cands_to_score:
         if use_multi:
-            cached = cached_d_per_cand.get((c["job_id"], c["result_index"]))
-            res = await score_image_composite(
-                scene, c["job_id"], c["data"], c["result_index"],
-                image_mode, algorithm, hash_size, sprite_sample_size,
-                gamma=image_gamma, count_k=image_count_k,
-                channels=image_channels,
-                min_contribution=image_min_contribution,
-                bonus_per_extra=image_bonus_per_extra,
-                cached_channels=cached,
-            )
-            raw = res["S"]
+            cand_key = (c["job_id"], c["result_index"])
+            # K=0 D-only fast path: skip A/B/C compute, the D batch
+            # already produced everything we need.
+            if use_d_batch and not use_abc_rerank:
+                d = d_results[cand_key]
+                raw = d["S"]
+            else:
+                cached = cached_d_per_cand.get(cand_key)
+                res = await score_image_composite(
+                    scene, c["job_id"], c["data"], c["result_index"],
+                    image_mode, algorithm, hash_size, sprite_sample_size,
+                    gamma=image_gamma, count_k=image_count_k,
+                    channels=image_channels,
+                    min_contribution=image_min_contribution,
+                    bonus_per_extra=image_bonus_per_extra,
+                    cached_channels=cached,
+                )
+                raw = res["S"]
             score = raw if raw >= threshold else 0.0
         elif use_new:
             res = await score_image_channel_a(

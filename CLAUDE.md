@@ -308,14 +308,16 @@ These are the bridge's calibrated behavior, not deployment-time knobs. Defaults 
 
 **Calibration coverage gap**: §13.9's calibrated values were tuned against high-quality Pexels content. On 240p video, single-studio corpora, monochrome film, etc., A/B/C all degrade. D doesn't — that's the entire point. **The right escape hatch when calibrated A/B/C scoring underperforms is to add D, not to change the calibrated values.**
 
-**Two-pass invariant** (gated by `BRIDGE_EMBEDDING_PREFILTER_K > 0` AND `embedding ∈ BRIDGE_IMAGE_CHANNELS` AND `BRIDGE_EMBEDDING_ENABLED=true`): when D is in the channel list, scoring runs in two passes. Pass 1 computes D over **every** candidate in a single matmul (~ms regardless of N) and ranks them. Pass 2 computes A/B/C only over the top-K survivors and combines via the §13.3 `max(fired) + bonus * (n_fired - 1)` formula, **reusing D's pass-1 score** rather than recomputing it. Two consequences:
+**D-batch invariant** (gated by `embedding ∈ BRIDGE_IMAGE_CHANNELS` AND `BRIDGE_EMBEDDING_ENABLED=true`): when D is in the channel list, every match request runs a single D-batch matmul over **every** candidate (~ms regardless of N) and ranks them. `BRIDGE_EMBEDDING_PREFILTER_K` then chooses what happens next:
 
-1. **A/B/C never see candidates D didn't already rank highly.** This eliminates the bonus-inversion failure mode (smoke evidence: scene 17397) where A/B/C corroborated a candidate D didn't favor and the bonus tipped the top-1 onto a wrong answer.
-2. **D's concept-only failure mode is resolvable** by A/B/C's frame-anchored signal (smoke evidence: scenes 17383, 17401). D ranks all related concepts together; A/B/C's color histogram + pHash discriminate on the specific frame.
+- **`K > 0` — two-pass**: A/B/C re-score only the top-K. Composite combines via §13.3 `max(fired) + bonus * (n_fired - 1)`, **reusing D's batch score** instead of recomputing. Two consequences:
+  1. A/B/C never see candidates D didn't already rank highly. This eliminates the bonus-inversion failure mode (smoke evidence: scene 17397) where A/B/C corroborated a candidate D didn't favor and the bonus tipped the top-1 onto a wrong answer.
+  2. D's concept-only failure mode is resolvable by A/B/C's frame-anchored signal (smoke evidence: scenes 17383, 17401). D ranks all related concepts together; A/B/C's color histogram + pHash discriminate on the specific frame.
+- **`K == 0` — embedding-only**: each candidate's score IS its D batch score; no A/B/C compute. Fastest path; accepts D's concept-only failures as the trade.
 
-`BRIDGE_EMBEDDING_PREFILTER_K=0` disables the two-pass and falls back to single-pass scoring across every candidate (only viable when A/B/C scoring stays under your timeout budget). For the legacy A/B/C-only path (no embedding in channels), nothing changes — single-pass behavior is preserved.
+For the legacy A/B/C-only path (no embedding in channels), K is ignored and single-pass behavior is preserved across every candidate.
 
-**Don't** route A/B/C scoring around D's prefilter when D is in channels. The whole correctness argument depends on A/B/C only seeing the top-K. Promoting an A/B/C-favored candidate D never ranked is the bug the two-pass design specifically prevents.
+**Don't** route A/B/C scoring around D's prefilter when K > 0 and D is in channels. The whole correctness argument depends on A/B/C only seeing the top-K. Promoting an A/B/C-favored candidate D never ranked is the bug the two-pass design specifically prevents.
 
 ### 13.11 Don'ts
 

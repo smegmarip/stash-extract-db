@@ -97,43 +97,50 @@ async def search(
 
     n_cand = len(candidates)
 
-    # Two-pass: D batch-ranks all candidates in one matmul, then A/B/C
-    # re-score only the top-K survivors. Search-mode caveat: candidates
-    # outside the top-K still appear in the result set but with image
-    # contribution computed from D's batch score only (no A/B/C corroboration
-    # bonus for them). That keeps top-N=limit working when limit > K.
-    # See docs/SEMANTIC_PREFILTER_PLAN.md.
+    # D-batch + (optional) A/B/C re-rank — same model as scrape.py:
+    #   - K  > 0  →  two-pass: D ranks all, A/B/C re-rank top-K. Candidates
+    #               outside the top-K get a D-only image_contrib so search
+    #               top-N still returns N items when limit > K.
+    #   - K == 0  →  embedding-only: every candidate's image_contrib is
+    #               its D batch score; no A/B/C compute.
     K = settings.bridge_embedding_prefilter_k
-    use_two_pass = bool(
+    use_d_batch = bool(
         use_multi
         and image_channels and "embedding" in image_channels
         and settings.bridge_embedding_enabled
-        and K > 0
-        and K < n_cand
     )
+    use_abc_rerank = use_d_batch and K > 0 and K < n_cand
+    d_results: dict[tuple[str, int], dict[str, Any]] = {}
+    top_k_keys: set[tuple[str, int]] = set()
     cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
-    if use_two_pass:
+    if use_d_batch:
         d_results = await score_image_channel_d_batch(
             scene, candidates, image_mode, sprite_sample_size,
         )
-        ranked = sorted(
-            candidates,
-            key=lambda c: (
-                -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
-                c["job_id"], c["result_index"],
-            ),
-        )
-        top_k_keys = {(c["job_id"], c["result_index"]) for c in ranked[:K]}
-        cached_d_per_cand = {
-            (c["job_id"], c["result_index"]): {
-                "embedding": d_results[(c["job_id"], c["result_index"])]
+        if use_abc_rerank:
+            ranked = sorted(
+                candidates,
+                key=lambda c: (
+                    -d_results.get((c["job_id"], c["result_index"]), {"S": 0.0})["S"],
+                    c["job_id"], c["result_index"],
+                ),
+            )
+            top_k_keys = {(c["job_id"], c["result_index"]) for c in ranked[:K]}
+            cached_d_per_cand = {
+                (c["job_id"], c["result_index"]): {
+                    "embedding": d_results[(c["job_id"], c["result_index"])]
+                }
+                for c in ranked[:K]
             }
-            for c in ranked[:K]
-        }
-        logger.info(
-            "search: image two-pass D-batch n=%d → re-score top_k=%d",
-            n_cand, len(top_k_keys),
-        )
+            logger.info(
+                "search: image two-pass D-batch n=%d → A/B/C re-rank top_k=%d",
+                n_cand, len(top_k_keys),
+            )
+        else:
+            logger.info(
+                "search: image embedding-only D-batch n=%d (K=0, A/B/C skipped)",
+                n_cand,
+            )
 
     stash_basename = _stash_basename(scene)
     scored: list[tuple[dict[str, Any], float, Optional[dict[str, Any]]]] = []
@@ -152,12 +159,11 @@ async def search(
 
         if use_multi:
             cand_key = (c["job_id"], c["result_index"])
-            # Two-pass split: top-K candidates get the full A/B/C+D
-            # composite (with cached D); candidates outside the top K
-            # get a D-only score from the batch result. Both call paths
-            # produce a `res` dict with the same shape; only the channels
-            # populated differ.
-            if use_two_pass and cand_key not in cached_d_per_cand:
+            # When D-batch ran AND this candidate isn't in the A/B/C
+            # re-rank set (either K=0, or top-K but this candidate
+            # didn't make the cut), use the D-only batch result
+            # directly — no A/B/C compute.
+            if use_d_batch and cand_key not in cached_d_per_cand:
                 d_only = d_results[cand_key]
                 image_contrib = d_only["S"]
                 image_dbg_extra = {
