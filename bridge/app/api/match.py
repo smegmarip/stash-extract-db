@@ -184,6 +184,44 @@ def _sanitize_text(s: Optional[str]) -> Optional[str]:
     return s or None
 
 
+# Stash expects YYYY-MM-DD; extractors pass through whatever the source
+# site publishes — human-readable ("May 14 2021", "Tues May 14, 2021"),
+# multilingual ("14 mai 2021"), or compact numeric ("20151128",
+# "20151128115037"). Two parsers cover the space:
+#   1. dateparser: natural-language + multilingual + non-standard weekday
+#      abbreviations + ISO. Fails on bare digit stamps because they're
+#      genuinely ambiguous without a hint (a 14-digit string is also a
+#      large integer).
+#   2. strptime fallback for digit-only strings of length 8 or 14, which
+#      are the unambiguous YYYYMMDD[HHMMSS] forms.
+# Per CLAUDE.md §11, unparseable dates neutralize the field rather than
+# penalize: return None and the Stash output omits Date entirely.
+def _normalize_date(s: Optional[str]) -> Optional[str]:
+    if not s or not isinstance(s, str):
+        return None
+    raw = s.strip()
+    if not raw:
+        return None
+
+    import dateparser as _dp
+    d = _dp.parse(raw)
+    if d is not None:
+        return d.date().isoformat()
+
+    # dateparser declined → only consider the unambiguous compact numeric
+    # forms; everything else is genuinely unparseable.
+    if raw.isdigit():
+        from datetime import datetime
+        for fmt in ("%Y%m%d%H%M%S", "%Y%m%d"):
+            try:
+                return datetime.strptime(raw, fmt).date().isoformat()
+            except ValueError:
+                continue
+
+    logger.debug("date: unparseable raw=%r", s)
+    return None
+
+
 async def _record_to_scrape_result(
     candidate: dict[str, Any],
     studio_name: Optional[str],
@@ -220,7 +258,7 @@ async def _record_to_scrape_result(
     return ScrapeResult(
         Title=rec.get("title") or None,
         Details=_sanitize_text(rec.get("details")),
-        Date=rec.get("date") or None,
+        Date=_normalize_date(rec.get("date")),
         URL=rec.get("url") or None,
         Code=code,
         Image=image_data_uri,

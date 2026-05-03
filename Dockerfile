@@ -34,6 +34,7 @@ RUN pip install --no-cache-dir \
     "Pillow>=11.0" \
     "numpy<2" \
     "guessit>=3.8" \
+    "dateparser>=1.2" \
     "transformers>=4.40,<5"
 
 COPY bridge /app/bridge
