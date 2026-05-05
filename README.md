@@ -6,6 +6,8 @@ A bridge service for [Stash](https://stashapp.cc) that lets a single Stash scrap
 > - [`docs/HOW_TO_USE.md`](docs/HOW_TO_USE.md) — operator's runbook (install, configure, verify, debug).
 > - [`docs/TESTING.md`](docs/TESTING.md) — testing strategy and calibration history.
 > - [`docs/calibration/`](docs/calibration/) — calibration harness + run-by-run results.
+> - [`docs/VIEWER_PLAN.md`](docs/VIEWER_PLAN.md) — viewer microservice plan (transient; folds into CLAUDE.md on merge).
+> - [`viewer/README.md`](viewer/README.md) — operator UI for browsing records / performers, status, and the match-test page.
 > - [`CLAUDE.md`](CLAUDE.md) — architectural invariants (project memory).
 > - [`requirements.md`](requirements.md) — full functional spec.
 
@@ -17,11 +19,12 @@ A bridge service for [Stash](https://stashapp.cc) that lets a single Stash scrap
 # 1. One-time: ensure the shared docker network exists
 docker network create extractor_network 2>/dev/null || true
 
-# 2. Bridge service
+# 2. Bridge + viewer
 cp .env.example .env
 $EDITOR .env                              # set STASH_URL etc.
 docker compose up -d --build
-curl http://localhost:13000/health
+curl http://localhost:13000/health        # bridge
+open  http://localhost:13100              # viewer UI (records, performers, status, query)
 
 # 3. Stash scraper
 cp -r stash-extract-scraper/ ~/.stash/scrapers/stash-extract-scraper/      # adjust path for your install
@@ -61,6 +64,10 @@ The image-tier scoring relies on a **featurization lifecycle**: per-job features
 ```
 Stash :9999 ◄── scraper.py ──► stash-extract-db :13000 ──► extractor :12000
                               (FastAPI bridge + SQLite cache + featurization workers)
+                                          ▲
+                                          │  /api/admin/*, /api/featurization/*, /match/*
+                                          │
+                              viewer :13100 (Vite SPA + Express proxy; read-only operator UI)
 ```
 
 The bridge is **read-only** on the Stash side (CLAUDE.md §9): it only calls `findScene` / `findPerformers` and never mutates. All writes go through Stash's normal scraper apply path.

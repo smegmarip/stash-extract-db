@@ -79,6 +79,36 @@ services:
       # take up to a couple minutes on cold caches.
       start_period: 120s
 
+  viewer:
+    build: ./viewer
+    container_name: stash-extract-db-viewer
+    restart: unless-stopped
+    ports:
+      - "${VIEWER_PORT:-13100}:3100"
+    environment:
+      BRIDGE_URL: "http://stash-extract-db:13000"
+      EXTRACTOR_URL: "${EXTRACTOR_URL:-http://extractor-gateway:12000}"
+      # Stash creds reused for forward-compat (v1 viewer doesn't call Stash
+      # directly — see docs/VIEWER_PLAN.md §5).
+      STASH_URL: "${STASH_URL:-http://host.docker.internal:9999}"
+      STASH_API_KEY: "${STASH_API_KEY:-}"
+      STASH_SESSION_COOKIE: "${STASH_SESSION_COOKIE:-}"
+      NODE_ENV: "production"
+      PORT: "3100"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - extractor_network
+    depends_on:
+      stash-extract-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fs", "http://localhost:3100/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+
 networks:
   extractor_network:
     name: ${DOCKER_NETWORK:-extractor_network}
