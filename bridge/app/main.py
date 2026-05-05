@@ -8,6 +8,7 @@ from .cache.db import init_db, close_db, backfill_performer_index
 from .api.health import router as health_router
 from .api.match import router as match_router
 from .api.featurization import router as featurization_router
+from .api.admin import router as admin_router
 from .matching import worker as featurize_worker
 
 
@@ -44,3 +45,4 @@ app = FastAPI(
 app.include_router(health_router)
 app.include_router(match_router)
 app.include_router(featurization_router)
+app.include_router(admin_router)
