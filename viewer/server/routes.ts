@@ -16,7 +16,7 @@ import { createProxyMiddleware, Options } from "http-proxy-middleware";
  *
  * Stash auth env vars (STASH_API_KEY, STASH_SESSION_COOKIE) are accepted but
  * unused in v1 — the viewer doesn't call Stash directly. Documented in
- * docs/VIEWER_PLAN.md §5 for forward compatibility.
+ * CLAUDE.md §17 for forward compatibility.
  */
 
 const BRIDGE_URL = process.env.BRIDGE_URL || "http://localhost:13000";

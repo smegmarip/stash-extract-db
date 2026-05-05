@@ -27,8 +27,15 @@ tests/
 │   ├── test_frames.py                # animation-aware decode: format allowlist, GIF/WebP/APNG
 │   │                                 # frame extraction, uniform temporal sampling, HEIF/AVIF skip
 │   │                                 # (CLAUDE.md §13.7/§13.8/§13.8.1)
-│   └── test_imgmatch_animated.py     # synthetic ref expansion, _parent_ref, _resolve_fingerprint_for,
-│                                     # _collapsed_stash_cover_fetcher, prefetched-bytes featurize path
+│   ├── test_imgmatch_animated.py     # synthetic ref expansion, _parent_ref, _resolve_fingerprint_for,
+│   │                                 # _collapsed_stash_cover_fetcher, prefetched-bytes featurize path
+│   ├── test_performer_index.py       # performer_index schema, populate hook, FK cascade, dedup,
+│   │                                 # null/non-string handling, idempotent backfill (CLAUDE.md §17)
+│   └── test_admin_endpoints.py       # /api/admin/* projections: jobs (incl. full feature_state),
+│                                     # records (search across id/title/url/performer with LIKE-escape,
+│                                     # sort by all four keys, pagination), record detail (asset URL
+│                                     # rewrite), performers (aggregation, alphabetical), performer
+│                                     # detail (grouping, case-insensitivity)
 ├── integration/
 │   └── test_calibration.py           # live harness that walks ground_truth.json against a running bridge
 └── calibration/
@@ -157,6 +164,29 @@ Animated-asset wiring in `bridge/app/matching/image_match.py` and `featurization
 
 Uses the `bridge_db` fixture for prefix-scan queries; otherwise mocks `ex_client.fetch_asset` and `stash_client.fetch_image_bytes` directly.
 
+### 2.11 `test_performer_index.py` (14 tests)
+
+Display-only aggregation index for the viewer (CLAUDE.md §17.2):
+
+- **Schema**: `init_db` creates the table and both indexes (`idx_performer_index_name`, `idx_performer_index_job`).
+- **Populate**: `upsert_job_and_results` inserts one row per `(job_id, result_index, name_lower)` from `data.performers`. Within-record dedup is case-insensitive (first-occurrence wins for display casing). Null/empty/non-string entries are skipped; whitespace is stripped.
+- **Cascade**: rows are picked up automatically by `extractor_results → extractor_jobs` FK chain when `completed_at` advances OR the parent job is directly deleted. Cross-job isolation: cascading j1 leaves j2's rows intact.
+- **Backfill**: `backfill_performer_index()` populates pre-migration corpora; idempotent (already-indexed jobs are skipped); zero-performer jobs are scanned but produce no rows; jobs already populated by the `upsert_job_and_results` hook are not re-scanned.
+
+These defend the §17 boundary: the viewer reads from a table that's a derived view of `extractor_results`, not a parallel source of truth.
+
+### 2.12 `test_admin_endpoints.py` (34 tests)
+
+`/api/admin/*` read-only projections (CLAUDE.md §17.3):
+
+- **Jobs**: returns scene-shaped jobs with record counts and full `feature_state` (state/progress/started/finished/error). Most-recent `completed_at` first. LEFT JOIN to `job_feature_state` produces nulls when no row exists.
+- **Records list**: `q` searches across id (exact), title (LIKE), url (LIKE), performer (LIKE on `performer_index`). User wildcards (`%`, `_`) are escaped — `q="%charlie%"` does NOT match a title containing "charlie". Sort by `id` / `title` / `date` / `performer` (the latter via correlated MIN subquery on `performer_index`); deterministic tiebreak `(job_id, result_index)` per CLAUDE.md §10. Pagination math (page/totalPages) verified.
+- **Record detail**: asset refs rewritten from `../assets/x.jpg` → `/api/asset/{job_id}/assets/x.jpg`; absolute URLs pass through unchanged; bare filenames routed to `assets/`; null/empty refs return `None`. `image_count` includes the cover. 404 on unknown index.
+- **Performers**: aggregation produces one row per distinct `name_lower`, with `record_count` and `job_count`. Display casing is the lex-min `name_original`. Job filter narrows. Name search via LIKE on `name_lower`. Pagination works.
+- **Performer detail**: case-insensitive lookup (`Alice` / `alice` / `ALICE` produce the same response). Records grouped by job, jobs ordered by `completed_at` DESC. 404 on unknown name. Asset URLs rewritten in nested records.
+
+These defend the §17.3 endpoint contract: shape, filtering, sorting, asset URL rewrite, and the invariant that the viewer never sees raw extractor URLs.
+
 ---
 
 ## 3. Integration test — `test_calibration.py`
@@ -271,6 +301,8 @@ Before tuning anything for a new corpus, run a 10–30 scene sample with `?debug
 | Code change in `match.py` API surface    | `pytest tests/unit/test_phase4_scoring_path.py tests/unit/test_phase5_multichannel.py` |
 | Code change in `embedding.py`            | `pytest tests/unit/test_embedding.py` (GPU-only encode tests auto-skip on CPU) |
 | Code change in D-batch / prefilter wiring | `pytest tests/unit/test_image_match_prefilter.py` |
+| Code change in performer_index populate / backfill | `pytest tests/unit/test_performer_index.py` |
+| Code change in `bridge/app/api/admin.py` or viewer-facing projections | `pytest tests/unit/test_admin_endpoints.py` |
 | Any code change                          | `pytest tests/unit/` (full suite)                |
 | Changing scoring defaults                | Re-run a calibration sweep, append to `CALIBRATION_RESULTS.md` (CLAUDE.md §13.11 don't) |
 | Suspicious match behavior in production  | Reproduce with `?debug=1` per `HOW_TO_USE.md` §5; if calibration suite has a cell that fits, re-run it |

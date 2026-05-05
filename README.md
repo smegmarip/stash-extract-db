@@ -6,8 +6,7 @@ A bridge service for [Stash](https://stashapp.cc) that lets a single Stash scrap
 > - [`docs/HOW_TO_USE.md`](docs/HOW_TO_USE.md) — operator's runbook (install, configure, verify, debug).
 > - [`docs/TESTING.md`](docs/TESTING.md) — testing strategy and calibration history.
 > - [`docs/calibration/`](docs/calibration/) — calibration harness + run-by-run results.
-> - [`docs/VIEWER_PLAN.md`](docs/VIEWER_PLAN.md) — viewer microservice plan (transient; folds into CLAUDE.md on merge).
-> - [`viewer/README.md`](viewer/README.md) — operator UI for browsing records / performers, status, and the match-test page.
+> - [`viewer/README.md`](viewer/README.md) — operator UI for browsing records / performers, status, and the match-test page (CLAUDE.md §17).
 > - [`CLAUDE.md`](CLAUDE.md) — architectural invariants (project memory).
 > - [`requirements.md`](requirements.md) — full functional spec.
 
@@ -114,7 +113,7 @@ See `docs/HOW_TO_USE.md` §7.
 
 ## Testing
 
-98 unit tests pass in ~8 seconds:
+202 unit tests pass in ~8 seconds:
 
 ```bash
 pytest tests/unit/

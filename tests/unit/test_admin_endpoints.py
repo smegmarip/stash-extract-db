@@ -1,6 +1,6 @@
 """Unit tests for /api/admin/* — display projections over the cache.
 
-Covers (per docs/VIEWER_PLAN.md §3, §8.1):
+Covers (per CLAUDE.md §17.3):
   - GET /api/admin/jobs returns scene-shaped jobs with record counts
   - GET /api/admin/records: search across id/title/url/performer; sort by all
     four keys; pagination math; job filter narrows correctly; tiebreak is

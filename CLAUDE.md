@@ -101,6 +101,7 @@ Users can clone, rename, or manually construct schemas. The seeded `"Video Scene
 | `image_uniqueness`                                   | cascade from `extractor_jobs` (`ON DELETE CASCADE`)                                    |
 | `job_feature_state`                                  | cascade from `extractor_jobs` (`ON DELETE CASCADE`); transitions per §14               |
 | `match_results`                                      | composite of scene fingerprint + job `completed_at`                                    |
+| `performer_index`                                    | cascade from `extractor_results` (transitive `ON DELETE CASCADE`); see §17             |
 
 **Don't** invalidate caches manually on a hunch. **Don't** add a TTL to any of these — TTLs hide bugs that the fingerprint-based invalidation would catch.
 
@@ -466,6 +467,8 @@ COMMIT
 # then enqueue a fresh featurize_task for this job_id
 ```
 
+`performer_index` rows are NOT explicitly deleted here. They have `FOREIGN KEY (job_id, result_index) REFERENCES extractor_results(...) ON DELETE CASCADE`, so the `DELETE FROM extractor_results` line picks them up automatically via the FK chain. Don't add a manual DELETE — that would couple the viewer's display index to the matching cascade and create two sources of truth for the lifecycle.
+
 Stash-side rows (`source IN ('stash_cover', 'stash_sprite', 'stash_aggregate')`) are not purged — see §7.
 
 ### 14.6 Eager-startup recovery
@@ -532,6 +535,7 @@ Extractor-side rows are never evicted — they're bounded by job count and clear
 | `job_feature_state`  | `(job_id)`                              | Featurization lifecycle (§14). FK to `extractor_jobs`.                                                                                                                                                           |
 | `match_results`      | composite of scene fingerprint + job CA | Memoized match output per (scene, job). Invalidates on either side change.                                                                                                                                       |
 | `image_hashes`       | (legacy)                                | Phase 1 single-channel pHash table. Soft-retired behind `BRIDGE_LEGACY_DUAL_WRITE_ENABLED` (default `true`). Drop is a manual op.                                                                                |
+| `performer_index`    | `(job_id, result_index, name_lower)`    | Display-only performer aggregation for the viewer (§17). Populated synchronously with `extractor_results` inside `upsert_job_and_results`; cascade-cleared via FK chain. Not consulted by the matching engine.   |
 
 ### 15.1 Quality is intrinsic; uniqueness is corpus-relative
 
@@ -578,3 +582,51 @@ While `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=true` (default): every pHash compute wri
 | FK violation on `job_feature_state` insert    | §14.2 — `ensure_job_results_fresh(job)` must run before the gate inserts the state row. Captured by `tests/unit/test_lifecycle.py::TestWorker::test_enqueue_creates_state`.                                                                                                                  |
 | Storage growing without bound                 | §14.9 — LRU eviction loop disabled (`BRIDGE_STASH_FEATURE_BUDGET_BYTES=0`?) or interval too long. Stash-side rows are the unbounded class; extractor-side rows are job-cascade-bound.                                                                                                          |
 | Animated cover / record asset never matches   | §13.8.1 — (a) HEIF/AVIF assets are hard-skipped per §13.8 rule 4; nothing to debug. (b) Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref — if absent, featurization saw the bytes as static (`is_animated_bytes` returned False) or PIL decode failed; treat as decode failure. (c) Average `count(synth_rows) / count(distinct_assets)` should be close to `BRIDGE_ANIMATED_FRAMES_MAX` for a corpus with mostly long animations; values much lower indicate truncated GIFs (rare) or featurization rerun with a stale code version (cache invalidation).                                          |
+| Performer missing from viewer Performers list | §17 — `performer_index` not populated for that job. Check `SELECT COUNT(*) FROM performer_index WHERE job_id='<job>'`. If empty, the populate hook in `upsert_job_and_results` either didn't run (job predates the schema migration) or the startup `backfill_performer_index()` task failed. Logs at startup show progress; re-run by deleting the row(s) and restarting the bridge. |
+
+---
+
+## 17. Viewer service is a read-only presenter
+
+> **The viewer microservice (`viewer/`) projects cache state into a browser UI. It writes nothing — not to Stash, not to the extractor, not to the bridge cache. All matching configuration stays on the bridge per §1.**
+
+The viewer is a sibling container on `extractor_network` (default port 13100). It runs a Vite SPA + Express proxy that forwards `/api/admin/*`, `/api/featurization/*`, `/api/extraction/*`, and `/match/*` to the bridge, and `/api/asset/{job_id}/...` to the extractor. The browser never reaches the extractor or Stash directly.
+
+### 17.1 The boundary contract
+
+- **Read-only** to all upstreams. Operator UIs that mutate cache state (e.g., "force re-featurize this job") belong on the bridge, not the viewer — the viewer can call them, but the verb lives on the bridge.
+- **No scoring fields** on the viewer side. The Query page forwards user-supplied parameters verbatim to `/match/*`; it does not invent defaults. This is the §1 rule restated for the viewer's role: per-deployment scoring is bridge env, not viewer config.
+- **Display detached from featurization.** Records render directly from `extractor_results` (stable from the moment the bridge fetched them per §7). Feature state surfaces as a passive badge / column; the viewer never blocks rendering on `state='ready'`. The 503 contract in §14 applies to `/match/*` only.
+
+### 17.2 The `performer_index` table
+
+Display-only aggregation over `extractor_results.data.performers`. Populated synchronously inside `upsert_job_and_results` in the same transaction as the result rows (so the browse view and the matching engine see consistent state). FK-cascaded via `extractor_results → extractor_jobs`, so §14.5 picks it up automatically without an explicit DELETE.
+
+- Identity: `name_lower` (case-insensitive). First-occurrence wins for `name_original` (display casing).
+- No alias collapse. The bridge's `findPerformers` alias resolution is a *match-time* concern (§5); the viewer's case-insensitive equality is a *browse* convenience.
+- Stash-side performers are not indexed here. This table aggregates extractor records, not Stash's library.
+- Backfill: `backfill_performer_index()` runs at startup. Idempotent (`INSERT OR IGNORE`); only scans jobs whose `performer_index` row count is zero. Pre-migration deployments are populated on first restart; subsequent restarts are cheap no-ops.
+
+### 17.3 The `/api/admin/*` surface
+
+Five read-only endpoints in `bridge/app/api/admin.py`:
+
+| Endpoint                                    | Purpose                                                                                          |
+| ------------------------------------------- | ------------------------------------------------------------------------------------------------ |
+| `GET /api/admin/jobs`                       | All jobs with record count + full feature_state (state/progress/started/finished/error).         |
+| `GET /api/admin/records`                    | Paginated; `q` searches id/title/url/performer (LIKE-escaped); sort id/title/date/performer.     |
+| `GET /api/admin/records/{job_id}/{idx}`     | Single record. Asset refs rewritten to bridge-relative `/api/asset/{job}/...` form.              |
+| `GET /api/admin/performers`                 | Distinct (case-insensitive) performers with record + job counts.                                 |
+| `GET /api/admin/performers/{name}`          | Records grouped by job, completed_at DESC.                                                        |
+
+Tiebreak in all sorts: `(job_id, result_index)` ascending — the §10 deterministic rule restated. User-supplied `%` and `_` in search input are escaped (`ESCAPE '\'`) so wildcards in queries never bypass the filter.
+
+### 17.4 Don'ts
+
+- **Don't** write to Stash, the extractor, or the bridge cache from the viewer process. The viewer is a presenter.
+- **Don't** add scoring config to the viewer side. The viewer has no concept of calibrated values; it forwards user-supplied parameters to the bridge.
+- **Don't** populate Stash-side performers in `performer_index`. That table aggregates `extractor_results`, not Stash's library.
+- **Don't** introduce a manual DELETE for `performer_index` in the §14.5 cascade. The FK chain is the contract.
+- **Don't** gate the Records / Performers / Status pages on featurization state. The 503 path is for `/match/*`; browse views render unconditionally.
+- **Don't** invoke an `express.json()` body parser in the viewer's Express layer. Every POST is proxied; consuming the body locally starves http-proxy-middleware of the stream and the bridge sees an empty request.
+- **Don't** alias-collapse performers in the viewer. Browse-time fuzzy match diverges from match-time fuzzy match in confusing ways; case-insensitive equality is the documented v1 contract.

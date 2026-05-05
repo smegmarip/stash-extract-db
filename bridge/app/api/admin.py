@@ -12,7 +12,7 @@ Asset URLs returned here are bridge-relative (`/api/asset/{job_id}/assets/x`).
 The viewer's Express layer proxies that path to the extractor so the browser
 never needs to reach the extractor directly.
 
-See docs/VIEWER_PLAN.md §3.2 for the endpoint contract.
+See CLAUDE.md §17.3 for the endpoint contract.
 """
 from __future__ import annotations
 

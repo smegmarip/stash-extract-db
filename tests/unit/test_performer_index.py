@@ -1,7 +1,7 @@
 """Unit tests for performer_index — display-only aggregation index for the
 viewer service.
 
-Covers (per docs/VIEWER_PLAN.md §3.1, §8.1):
+Covers (per CLAUDE.md §17.2):
   - Schema is created by init_db
   - upsert_job_and_results populates rows from data.performers
   - Cascade clears rows when a job is replaced (FK chain through

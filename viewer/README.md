@@ -5,8 +5,9 @@ records and performers, surfaces featurization status, and exercises the
 match endpoints. Sibling container to the bridge; mounted on the same
 `extractor_network`.
 
-> Architectural plan: [`docs/VIEWER_PLAN.md`](../docs/VIEWER_PLAN.md).
-> Bridge invariants: [`CLAUDE.md`](../CLAUDE.md).
+> Bridge invariants — including the read-only presenter contract, the
+> `performer_index` table, and the `/api/admin/*` surface — live in
+> [`CLAUDE.md`](../CLAUDE.md) §17.
 > Read-only: no writes to Stash, the extractor, or the bridge cache.
 
 ---

@@ -50,6 +50,8 @@ docker compose up -d --build
 curl http://localhost:13000/health   # → {"status":"ok"}
 ```
 
+The compose file also brings up the **viewer** sibling container — a read-only operator UI at `http://localhost:13100` (configurable via `VIEWER_PORT`). It's optional for the scraper path; if you only need the bridge, `docker compose up -d --build stash-extract-db` skips it. See `viewer/README.md` for what the UI does and CLAUDE.md §17 for why it exists.
+
 If the lifecycle is enabled, watch featurization populate the cache for any extractor jobs already on the system:
 
 ```bash
@@ -365,6 +367,8 @@ For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the sym
 | Bridge unresponsive (`/health` timing out) during heavy work | Possible regression of the asyncio.to_thread fix — see CLAUDE.md §14.4. Run `pytest tests/unit/test_lifecycle.py::TestEventLoopResponsiveness`.                             |
 | Need to nuke everything and start fresh                      | `docker compose down -v` won't delete `./data/`. Do `rm -rf ./data && docker compose up -d --build`.                                                                        |
 | Animated cover/asset never matches                           | Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref. If absent, featurization saw the bytes as static or PIL decode failed; treat as decode failure. HEIF/AVIF are hard-skipped by design (CLAUDE.md §13.8.1).   |
+| Viewer Performers list missing a name you expect             | CLAUDE.md §17 / §16 — `performer_index` empty for that job. Check `SELECT COUNT(*) FROM performer_index WHERE job_id='<job>'`. If 0, restart the bridge to re-run `backfill_performer_index()` (logs progress at startup). The viewer itself is a passive renderer; data gaps are always upstream. |
+| Viewer Query page returns ERR_EMPTY_RESPONSE                 | Regression of the `viewer/server/index.ts` no-body-parser rule (CLAUDE.md §17.4). `express.json()` consumes the POST stream before http-proxy-middleware can forward it; the bridge sees an empty request and the proxy hangs.                       |
 
 ---
 
@@ -377,6 +381,7 @@ Every environment variable consumed by the bridge or `docker-compose.yml`, in tw
 | Variable                               | Default                            | Purpose                                                                                                                                                                                        |
 | -------------------------------------- | ---------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `BRIDGE_PORT` _(compose)_              | `13000`                            | Host port that maps to the bridge container's 13000.                                                                                                                                           |
+| `VIEWER_PORT` _(compose)_              | `13100`                            | Host port for the viewer microservice (read-only operator UI; CLAUDE.md §17). The container always listens on 3100 internally.                                                                 |
 | `DATA_PATH` _(compose)_                | `./data`                           | Host directory bind-mounted at `/data` in the container. Holds the SQLite cache.                                                                                                               |
 | `DOCKER_NETWORK` _(compose)_           | `extractor_network`                | External Docker network name. Bridge attaches to it to talk to the extractor.                                                                                                                  |
 | `STASH_URL`                            | `http://host.docker.internal:9999` | Where Stash is reachable from inside the bridge container.                                                                                                                                     |
