@@ -106,6 +106,21 @@ CREATE TABLE IF NOT EXISTS job_feature_state (
   error         TEXT,
   FOREIGN KEY (job_id) REFERENCES extractor_jobs(job_id) ON DELETE CASCADE
 );
+
+-- Display-only performer aggregation index for the viewer service.
+-- Populated synchronously with extractor_results inside upsert_job_and_results;
+-- cascaded by FK chain through extractor_results -> extractor_jobs.
+-- name_lower is used for grouping and search; name_original preserves display casing.
+CREATE TABLE IF NOT EXISTS performer_index (
+  job_id        TEXT NOT NULL,
+  result_index  INTEGER NOT NULL,
+  name_lower    TEXT NOT NULL,
+  name_original TEXT NOT NULL,
+  PRIMARY KEY (job_id, result_index, name_lower),
+  FOREIGN KEY (job_id, result_index) REFERENCES extractor_results(job_id, result_index) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_performer_index_name ON performer_index(name_lower);
+CREATE INDEX IF NOT EXISTS idx_performer_index_job ON performer_index(job_id);
 """
 
 
@@ -147,6 +162,28 @@ async def get_cached_job(job_id: str) -> Optional[dict[str, Any]]:
             "completed_at": row[3], "fetched_at": row[4]}
 
 
+def _extract_performer_rows(
+    job_id: str, result_index: int, data: dict[str, Any],
+) -> list[tuple[str, int, str, str]]:
+    """Build performer_index rows for a single record.
+
+    Performers are a list of strings on `data.performers`. Skip null/empty;
+    dedupe within a record by lowercased name.
+    """
+    perfs = data.get("performers") or []
+    seen: dict[str, str] = {}
+    for p in perfs:
+        if not isinstance(p, str):
+            continue
+        name = p.strip()
+        if not name:
+            continue
+        key = name.lower()
+        # First occurrence wins for the display casing.
+        seen.setdefault(key, name)
+    return [(job_id, result_index, key, name) for key, name in seen.items()]
+
+
 async def upsert_job_and_results(
     job_id: str,
     job_name: str,
@@ -159,10 +196,11 @@ async def upsert_job_and_results(
 
     Cascade per CLAUDE.md §7 + §14.5: deleting the
     extractor_jobs row cascades via FK to extractor_results, corpus_stats,
-    image_uniqueness, and job_feature_state. match_results and the
-    extractor-side image_features rows have no FK and are deleted manually.
-    Stash-side image_features rows survive — they're keyed by Stash content
-    fingerprint, not by job, and remain valid across job changes.
+    image_uniqueness, job_feature_state, and performer_index (transitively
+    through extractor_results). match_results and the extractor-side
+    image_features rows have no FK and are deleted manually. Stash-side
+    image_features rows survive — they're keyed by Stash content fingerprint,
+    not by job, and remain valid across job changes.
     """
     import json
     conn = db()
@@ -174,14 +212,23 @@ async def upsert_job_and_results(
             (job_id, job_name, schema_id, completed_at, fetched_at),
         )
         rows = []
+        perf_rows: list[tuple[str, int, str, str]] = []
         for idx, r in enumerate(results):
             page_url = r.get("page_url") or ""
-            data_json = json.dumps(r.get("data") or {}, ensure_ascii=False)
+            data = r.get("data") or {}
+            data_json = json.dumps(data, ensure_ascii=False)
             rows.append((job_id, idx, page_url, data_json))
+            perf_rows.extend(_extract_performer_rows(job_id, idx, data))
         await conn.executemany(
             "INSERT INTO extractor_results(job_id, result_index, page_url, data_json) VALUES (?, ?, ?, ?)",
             rows,
         )
+        if perf_rows:
+            await conn.executemany(
+                "INSERT INTO performer_index(job_id, result_index, name_lower, name_original) "
+                "VALUES (?, ?, ?, ?)",
+                perf_rows,
+            )
         await conn.execute("DELETE FROM match_results WHERE job_id = ?", (job_id,))
         # Extractor-side image_features rows have no FK to extractor_jobs
         # (Stash-side rows must survive); purge them manually.
@@ -195,6 +242,60 @@ async def upsert_job_and_results(
     except Exception:
         await conn.rollback()
         raise
+
+
+async def backfill_performer_index() -> int:
+    """Populate performer_index from extractor_results rows that are not yet
+    indexed. Idempotent — uses INSERT OR IGNORE; safe to run on every startup.
+    Returns the number of rows inserted.
+
+    A job is treated as "needs backfill" if it has any extractor_results rows
+    but no performer_index rows. This avoids re-scanning jobs whose records
+    legitimately have no performers (a non-empty extractor_results paired with
+    an empty performer_index is indistinguishable from "not yet backfilled"
+    using row counts alone, but INSERT OR IGNORE makes a re-scan cheap).
+    """
+    import json
+    conn = db()
+    inserted = 0
+    # Find candidate jobs: those with results but zero performer_index rows.
+    async with conn.execute(
+        "SELECT DISTINCT er.job_id FROM extractor_results er "
+        "WHERE NOT EXISTS ("
+        "  SELECT 1 FROM performer_index pi WHERE pi.job_id = er.job_id"
+        ")"
+    ) as cur:
+        candidate_jobs = [row[0] async for row in cur]
+
+    if not candidate_jobs:
+        return 0
+
+    logger.info("performer_index backfill: %d candidate job(s)", len(candidate_jobs))
+    for job_id in candidate_jobs:
+        async with conn.execute(
+            "SELECT result_index, data_json FROM extractor_results WHERE job_id = ?",
+            (job_id,),
+        ) as cur:
+            results = await cur.fetchall()
+        rows: list[tuple[str, int, str, str]] = []
+        for result_index, data_json in results:
+            try:
+                data = json.loads(data_json)
+            except Exception:
+                continue
+            rows.extend(_extract_performer_rows(job_id, int(result_index), data))
+        if not rows:
+            continue
+        await conn.executemany(
+            "INSERT OR IGNORE INTO performer_index(job_id, result_index, name_lower, name_original) "
+            "VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        inserted += len(rows)
+    await conn.commit()
+    if inserted:
+        logger.info("performer_index backfill: inserted %d row(s)", inserted)
+    return inserted
 
 
 async def list_results(job_id: str) -> list[dict[str, Any]]:
