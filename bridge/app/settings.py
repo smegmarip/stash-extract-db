@@ -33,6 +33,19 @@ class Settings(BaseSettings):
     bridge_image_channels: str = "phash,color_hist,tone"
     bridge_image_search_floor: Optional[float] = None  # mechanism shipped, default off (Run 6)
 
+    # --- Animated assets (CLAUDE.md §13.7/§13.8). Both Stash's
+    # `paths.screenshot` and extractor `cover_image`/`images[]` may be
+    # animated GIF / animated WebP / APNG. HEIF/AVIF are hard-skipped per
+    # the format allowlist in imgmatch/frames.py.
+    #   - FRAMES_MAX caps extractor-side uniform-sampling output per asset
+    #     (mirrors BRIDGE_SPRITE_SAMPLE_SIZE so multi-frame records don't
+    #     blow out count_conf).
+    #   - COVER_MODE controls Stash-cover collapse: `middle` picks the
+    #     temporal middle frame; `median` computes a per-pixel median
+    #     (more robust to motion artifacts but ghosts on moving subjects).
+    bridge_animated_frames_max: int = 8
+    bridge_animated_cover_mode: str = "middle"  # middle | median
+
     # --- Channel D: semantic embedding (DINOv2). Disabled by default.
     # When enabled, featurization computes per-image embeddings using
     # the configured model and stores them as image_features rows with

@@ -53,9 +53,15 @@ def fake_embedding_blobs(monkeypatch):
     async def fake_stash_sprite(scene, sample_size):
         return []  # cover-only is enough for these tests
 
+    async def _identity_expand(job_id, refs):
+        # Tests don't exercise animated-asset expansion; pass refs through
+        # unchanged. The expansion machinery has its own coverage.
+        return list(refs)
+
     monkeypatch.setattr(im, "extractor_image_embedding", fake_extractor)
     monkeypatch.setattr(im, "stash_cover_embedding", fake_stash_cover)
     monkeypatch.setattr(im, "stash_sprite_embeddings", fake_stash_sprite)
+    monkeypatch.setattr(im, "_expanded_extractor_refs", _identity_expand)
 
     def install(stash_vec, ref_to_vec):
         state["stash"] = stash_vec

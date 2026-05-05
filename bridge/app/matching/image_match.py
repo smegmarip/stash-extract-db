@@ -28,6 +28,7 @@ from .imgmatch.image_comparison import (
     hash_image_bytes, hex_to_hash, hash_distance_to_similarity,
 )
 from .imgmatch.sprite_processor import hash_sprite_frames
+from .imgmatch import frames as _frames
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,23 @@ def _scene_oshash(scene: dict[str, Any]) -> str:
     return ""
 
 
+async def _collapsed_stash_cover_fetcher(url: str) -> Optional[bytes]:
+    """Stash-cover bytes, with animated formats collapsed to a single
+    representative JPEG frame (CLAUDE.md §13.7). Static inputs pass
+    through unchanged. Decode failures (HEIF/AVIF, malformed bytes) return
+    None — propagated to the caller as a §13.8 rule 1 fetch failure."""
+    data = await stash_client.fetch_image_bytes(url)
+    if not data:
+        return None
+    if not _frames.is_animated_bytes(data):
+        return data
+    collapsed = await asyncio.to_thread(
+        _frames.collapse_stash_cover, data,
+        mode=settings.bridge_animated_cover_mode,
+    )
+    return collapsed
+
+
 def _phash_algo_key(algorithm: str, hash_size: int) -> str:
     """Combined algorithm string for image_features (e.g. 'phash:8'). The
     legacy image_hashes table keeps algorithm and hash_size as separate
@@ -60,8 +78,14 @@ async def _hash_or_compute(
     source: str, ref_id: str, fingerprint: str,
     algorithm: str, hash_size: int,
     fetcher,
+    prefetched_bytes: Optional[bytes] = None,
 ) -> Optional[Any]:
     """fetcher() -> bytes (awaitable). Returns imagehash or None.
+
+    `prefetched_bytes`: when provided, the fetcher is bypassed entirely and
+    these bytes are hashed directly. Used by the featurization path which
+    fetches each animated asset once and computes per-frame features
+    against pre-decoded JPEG bytes (CLAUDE.md §13.7/§13.8).
 
     Dual-write Phase 2: reads from image_features first (channel='phash'),
     falls back to legacy image_hashes on miss. On compute, writes to both
@@ -96,7 +120,7 @@ async def _hash_or_compute(
         if cached_hex:
             return hex_to_hash(cached_hex)
 
-    data = await fetcher()
+    data = prefetched_bytes if prefetched_bytes is not None else await fetcher()
     if not data:
         # Asset unfetchable (404, network error). Cache the failure so
         # future scrapes don't re-attempt the same fetch.
@@ -133,7 +157,7 @@ async def stash_cover_hash(scene: dict[str, Any], algorithm: str, hash_size: int
     fingerprint = _screenshot_fingerprint(url) or url  # fallback to whole URL
     return await _hash_or_compute(
         "stash_cover", scene["id"], fingerprint, algorithm, hash_size,
-        lambda: stash_client.fetch_image_bytes(url),
+        lambda: _collapsed_stash_cover_fetcher(url),
     )
 
 
@@ -206,15 +230,52 @@ async def stash_sprite_hashes(scene: dict[str, Any], algorithm: str, hash_size: 
     return hashes
 
 
-async def extractor_image_hash(job_id: str, ref: str, algorithm: str, hash_size: int):
-    """ref is the record's image string (e.g. ../assets/abc.jpg or full URL)."""
+async def extractor_image_hash(
+    job_id: str, ref: str, algorithm: str, hash_size: int,
+    *, prefetched_bytes: Optional[bytes] = None,
+):
+    """ref is the record's image string (e.g. ../assets/abc.jpg or full URL),
+    OR a synthetic frame ref `<original_ref>#frame_N` produced by featurization
+    on an animated asset (CLAUDE.md §13.7/§13.8). Synthetic refs share the
+    parent asset's URL as their fingerprint (same invalidation cohort).
+    """
     if not ref:
         return None
-    full_url = ex_client.resolve_asset_url(job_id, ref) if not ref.startswith("http") else ref
+    parent = _parent_ref(ref)
+    full_url = ex_client.resolve_asset_url(job_id, parent) if not parent.startswith("http") else parent
     return await _hash_or_compute(
         "extractor_image", f"{job_id}:{ref}", full_url, algorithm, hash_size,
-        lambda: ex_client.fetch_asset(job_id, ref),
+        lambda: ex_client.fetch_asset(job_id, parent),
+        prefetched_bytes=prefetched_bytes,
     )
+
+
+def _parent_ref(ref: str) -> str:
+    """Strip the `#frame_N` suffix from a synthetic ref. Static refs are
+    returned unchanged. Used to recover the underlying asset URL for
+    fingerprint construction without needing a separate lookup table."""
+    idx = ref.find("#frame_")
+    return ref[:idx] if idx >= 0 else ref
+
+
+async def _expanded_extractor_refs(job_id: str, refs: list[str]) -> list[str]:
+    """Replace each animated ref with its persisted synthetic frame refs.
+    Static refs pass through unchanged. Order is preserved.
+
+    Featurization writes one row per frame for animated assets; matching
+    reads them back via this helper so per-channel scoring iterates the
+    expanded set as if every frame were an independent record image
+    (CLAUDE.md §13.7). Static-only corpora produce identical output to
+    the input (one prefix scan per ref, all empty).
+    """
+    out: list[str] = []
+    for ref in refs:
+        frame_refs = await cdb.list_frame_refs_for_extractor_ref(job_id, ref)
+        if frame_refs:
+            out.extend(frame_refs)
+        else:
+            out.append(ref)
+    return out
 
 
 # --- Multi-channel per-image features (Phase 5) -----------------------------
@@ -228,12 +289,16 @@ CHANNEL_C_ALGO = "tone:gray:8x8"
 
 async def _features_or_compute_bc(
     source: str, ref_id: str, fingerprint: str, fetcher,
+    prefetched_bytes: Optional[bytes] = None,
 ) -> dict[str, Optional[tuple[bytes, float]]]:
     """Read or compute channel B and C features for one image. Single fetch
     serves both. Returns {channel: (blob, quality) or None}.
 
     None values mean "no usable feature" — empty fingerprint, fetch failed,
     or the image couldn't be opened.
+
+    `prefetched_bytes`: when provided, bypasses the fetcher (CLAUDE.md
+    §13.7/§13.8 — animated extractor assets fetch once, compute per-frame).
     """
     from .imgmatch.channels import color_hist_from_bytes, tone_from_bytes
 
@@ -260,7 +325,7 @@ async def _features_or_compute_bc(
     if b_attempted and c_attempted:
         return out
 
-    data = await fetcher()
+    data = prefetched_bytes if prefetched_bytes is not None else await fetcher()
     if not data:
         # Asset unfetchable. Mark sentinel for whichever channels weren't
         # already cached (success or failure) so we don't refetch on every
@@ -300,16 +365,20 @@ async def _features_or_compute_bc(
 
 async def extractor_image_bc_features(
     job_id: str, ref: str,
+    *, prefetched_bytes: Optional[bytes] = None,
 ) -> dict[str, Optional[tuple[bytes, float]]]:
     """Channel B + C features for one extractor image. Caches in
     image_features. Channel A is handled separately by extractor_image_hash
-    (which has the legacy image_hashes fallback)."""
+    (which has the legacy image_hashes fallback). Accepts synthetic frame
+    refs `<ref>#frame_N` (CLAUDE.md §13.7/§13.8)."""
     if not ref:
         return {"color_hist": None, "tone": None}
-    full_url = ex_client.resolve_asset_url(job_id, ref) if not ref.startswith("http") else ref
+    parent = _parent_ref(ref)
+    full_url = ex_client.resolve_asset_url(job_id, parent) if not parent.startswith("http") else parent
     return await _features_or_compute_bc(
         "extractor_image", f"{job_id}:{ref}", full_url,
-        lambda: ex_client.fetch_asset(job_id, ref),
+        lambda: ex_client.fetch_asset(job_id, parent),
+        prefetched_bytes=prefetched_bytes,
     )
 
 
@@ -323,7 +392,7 @@ async def stash_cover_bc_features(
     fingerprint = _screenshot_fingerprint(url) or url
     return await _features_or_compute_bc(
         "stash_cover", scene["id"], fingerprint,
-        lambda: stash_client.fetch_image_bytes(url),
+        lambda: _collapsed_stash_cover_fetcher(url),
     )
 
 
@@ -333,11 +402,15 @@ async def stash_cover_bc_features(
 
 async def _embedding_or_compute(
     source: str, ref_id: str, fingerprint: str, fetcher,
+    prefetched_bytes: Optional[bytes] = None,
 ) -> Optional[bytes]:
     """Read or compute the channel-D embedding for one image. Returns
     the raw blob (fp16 vector serialized) or None on unrecoverable
     failure (404, decode fail). Negative-cache sentinel writes prevent
     repeat fetch attempts on the same dead ref.
+
+    `prefetched_bytes`: when provided, bypasses the fetcher (CLAUDE.md
+    §13.7/§13.8 — animated extractor assets fetch once, compute per-frame).
     """
     from . import embedding as emb
 
@@ -351,7 +424,7 @@ async def _embedding_or_compute(
     if await cdb.is_feature_attempt_cached(source, ref_id, fingerprint, "embedding", algo):
         return None
 
-    data = await fetcher()
+    data = prefetched_bytes if prefetched_bytes is not None else await fetcher()
     if not data:
         await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "embedding", algo)
         return None
@@ -373,15 +446,21 @@ async def _embedding_or_compute(
     return blob
 
 
-async def extractor_image_embedding(job_id: str, ref: str) -> Optional[bytes]:
+async def extractor_image_embedding(
+    job_id: str, ref: str,
+    *, prefetched_bytes: Optional[bytes] = None,
+) -> Optional[bytes]:
     """Channel D embedding blob for one extractor image. None if
-    unfetchable / undecodeable / sentineled."""
+    unfetchable / undecodeable / sentineled. Accepts synthetic frame refs
+    `<ref>#frame_N` (CLAUDE.md §13.7/§13.8)."""
     if not ref:
         return None
-    full_url = ex_client.resolve_asset_url(job_id, ref) if not ref.startswith("http") else ref
+    parent = _parent_ref(ref)
+    full_url = ex_client.resolve_asset_url(job_id, parent) if not parent.startswith("http") else parent
     return await _embedding_or_compute(
         "extractor_image", f"{job_id}:{ref}", full_url,
-        lambda: ex_client.fetch_asset(job_id, ref),
+        lambda: ex_client.fetch_asset(job_id, parent),
+        prefetched_bytes=prefetched_bytes,
     )
 
 
@@ -394,7 +473,7 @@ async def stash_cover_embedding(scene: dict[str, Any]) -> Optional[bytes]:
     fingerprint = _screenshot_fingerprint(url) or url
     return await _embedding_or_compute(
         "stash_cover", scene["id"], fingerprint,
-        lambda: stash_client.fetch_image_bytes(url),
+        lambda: _collapsed_stash_cover_fetcher(url),
     )
 
 
@@ -645,6 +724,7 @@ async def all_pair_sims(
         refs = [cover_ref] + refs
     if not refs:
         return [], 0
+    refs = await _expanded_extractor_refs(job_id, refs)
 
     extractor_hashes: list = []
     for ref in refs:
@@ -736,6 +816,7 @@ async def _gather_pair_data(
     cover_ref = record.get("cover_image")
     if cover_ref and cover_ref not in refs:
         refs = [cover_ref] + refs
+    refs = await _expanded_extractor_refs(job_id, refs)
 
     extractor_hashes: list = []
     extractor_refs: list[str] = []
@@ -881,12 +962,15 @@ async def score_image_channel_a(
 
 def _resolve_fingerprint_for(job_id: str, ref: str) -> str:
     """Mirror of the fingerprint convention used by extractor_image_hash:
-    for extractor images, the fingerprint is the resolved asset URL.
-    Used to look up cached image_features rows.
+    for extractor images, the fingerprint is the resolved asset URL of
+    the underlying asset (parent ref). Synthetic frame refs of an animated
+    asset all share the parent asset's URL as their fingerprint
+    (CLAUDE.md §13.7) — invalidates as one cohort on cascade.
     """
-    if ref.startswith("http"):
-        return ref
-    return ex_client.resolve_asset_url(job_id, ref)
+    parent = _parent_ref(ref)
+    if parent.startswith("http"):
+        return parent
+    return ex_client.resolve_asset_url(job_id, parent)
 
 
 # --- Phase 5: channels B and C scoring entry points ------------------------
@@ -957,11 +1041,14 @@ async def score_image_channel_b(
     stash_agg = await _stash_color_hist_aggregate(scene, sprite_sample_size)
 
     # Look up the precomputed extractor record aggregate. Fingerprint
-    # convention matches what featurization writes: sorted("|".join(refs)).
+    # convention matches what featurization writes: sorted("|".join(refs))
+    # — over the *expanded* refs so animated assets contribute their
+    # synthetic frame refs rather than the original ref (CLAUDE.md §13.7).
     refs: list[str] = list(record.get("images") or [])
     cover = record.get("cover_image")
     if cover and cover not in refs:
         refs = [cover] + refs
+    refs = await _expanded_extractor_refs(job_id, refs)
     fingerprint = "|".join(sorted(refs))
     rec_agg_row = await cdb.get_image_feature(
         "extractor_aggregate", f"{job_id}:{record_idx}", fingerprint,
@@ -1026,6 +1113,7 @@ async def score_image_channel_c(
     cover = record.get("cover_image")
     if cover and cover not in refs:
         refs = [cover] + refs
+    refs = await _expanded_extractor_refs(job_id, refs)
 
     extractor_blobs: list[_np.ndarray] = []
     extractor_refs: list[str] = []
@@ -1124,6 +1212,7 @@ async def score_image_channel_d(
     cover = record.get("cover_image")
     if cover and cover not in refs:
         refs = [cover] + refs
+    refs = await _expanded_extractor_refs(job_id, refs)
 
     extractor_blobs: list[bytes] = []
     extractor_refs: list[str] = []
@@ -1231,6 +1320,7 @@ async def score_image_channel_d_batch(
         cover = c["data"].get("cover_image")
         if cover and cover not in refs:
             refs = [cover] + refs
+        refs = await _expanded_extractor_refs(c["job_id"], refs)
         start = len(all_blobs)
         kept_refs: list[str] = []
         for ref in refs:

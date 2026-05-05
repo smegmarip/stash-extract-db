@@ -52,6 +52,8 @@ For each scene the user invokes the scraper on:
 
 The image-tier scoring relies on a **featurization lifecycle**: per-job features (per-image quality, per-channel baseline, per-image uniqueness) are computed eagerly at container startup and on cascade invalidation, then cached in SQLite. Match requests against jobs whose features aren't ready return `503 Service Unavailable + Retry-After`. See CLAUDE.md §14.
 
+**Animated assets**: both Stash `paths.screenshot` and extractor `cover_image`/`images[]` may be animated GIF / animated WebP / APNG. Stash-cover collapses to a single representative frame; extractor-side animated assets expand into bounded scene-detected frames at featurization time. HEIF / AVIF are hard-skipped. See CLAUDE.md §13.8.1.
+
 ---
 
 ## Architecture

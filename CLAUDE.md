@@ -268,8 +268,35 @@ The per-image filtering rules apply per-image and per-channel:
 1. **404 / fetch failure** (`extractor/client.fetch_asset` returns `None`). Drop the ref entirely from all channels.
 2. **Low pixel variance at hash time** (`imgmatch/image_comparison.hash_image_bytes` returns `None`). Catches all-black sprite frames at the source.
 3. **Degenerate-hash check at sim time** (`_is_degenerate_hash`). Belt-and-braces for any pHash with bit-density outside `[10%, 90%]`. Affects only channel A.
+4. **Unsupported image format**. The decode allowlist in `imgmatch/frames.py` accepts only PIL formats `{GIF, WEBP, PNG, JPEG}`. HEIF / AVIF (sequenced or otherwise), arbitrary garbage, and any format PIL can't decode are treated as rule 1 fetch failures — drop the ref entirely.
 
 A filter failure on one channel does not exclude the image from other channels — channel A might filter a frame for low pHash variance while channel B still uses its color histogram.
+
+### 13.8.1 Animated assets (Stash + extractor)
+
+> **Stash `paths.screenshot` may itself be animated. Extractor `cover_image` / `images[]` likewise. Animated decode is asymmetric by side, deterministic by content, and runs only at featurization time — never on the request hot path.**
+
+Both sides treat animation as a featurization-time concern, not a match-time concern. Animation handling never runs synchronously inside a `/match/*` request — see §14.
+
+- **Stash-cover side** (`_collapsed_stash_cover_fetcher`): an animated screenshot is collapsed to a single representative frame (`BRIDGE_ANIMATED_COVER_MODE=middle` picks the temporal middle frame; `median` produces a per-pixel median). The collapsed JPEG bytes feed the same channel A/B/C/D compute as a static cover. One cover-mode comparison still equals one cover feature; cache keys (`stash_cover` + screenshot epoch fingerprint) are unchanged. Sprites are unaffected — sprite mode already provides scene-spanning coverage and animated covers are ignored when sprite mode is active.
+
+- **Extractor side** (featurization): an animated `cover_image` / `images[]` ref is sampled at uniform temporal indices via PIL (`uniform_sample_frames`, capped at `BRIDGE_ANIMATED_FRAMES_MAX`) and expands into N synthetic frame refs of the form `<original_ref>#frame_<i>`. Each synthetic ref gets its own `image_features` rows under `source='extractor_image'`; the parent (un-suffixed) ref does NOT get its own row. All frames of one asset share the parent asset's URL as their fingerprint, so cascade invalidation (§14.5) drops them as one cohort.
+
+  **Why uniform sampling and not scene-detect**: animated assets in real corpora are typically short action loops with no scene cuts. ffmpeg scene-detect at `threshold=0.4` collapsed nearly every animated asset to a single frame in production (109 animated assets → 117 synth rows, ~1.07 frames per asset), defeating the entire purpose of multi-frame embedding. Uniform sampling guarantees N representative frames spanning the asset's temporal extent; redundancy across similar frames is handled corpus-wide by the A/B/C tier's `c_i` (uniqueness) factor, not by per-asset dedup.
+
+- **Match-time expansion** (`_expanded_extractor_refs`): before iterating a record's images, the bridge prefix-scans `image_features` for `<job_id>:<ref>#frame_%`. Any hits replace the parent ref with its synthetic-frame children (in numeric frame-index order); refs with no hits pass through unchanged (treated as static). The expansion mapping is recovered from already-cached rows — no decode work happens at match time.
+
+- **Hard-skip on decode failure**: an animated asset whose PIL decode fails or returns zero usable frames is dropped per §13.8 rule 1. No fallback to "frame 0" — that's the bug this design replaces.
+
+- **Featurization fetches each animated asset once.** All channel computes for the synthetic frames feed off the same already-decoded JPEG bytes via the `prefetched_bytes` parameter on the per-channel feature builders. Without this, every channel would re-fetch and re-decode, multiplying I/O and CPU by the number of channels.
+
+- **B-aggregate fingerprint must match between featurization and match-time.** The per-record channel-B aggregate row is keyed by the sorted refs in the record after expansion. Featurization sorts after expansion; match-time sorts after `_expanded_extractor_refs`. Both must produce the same sorted set or the cache misses. Changing the expansion key format requires re-featurizing affected jobs.
+
+- **Lifecycle-disabled fallback is static-only.** When `BRIDGE_LIFECYCLE_ENABLED=false`, the bridge falls through to legacy on-demand caching against `image_hashes`. That path predates synthetic refs and treats animated assets as static (frame 0). This is acceptable because lifecycle-disabled is documented as a rollback escape hatch, not a steady-state mode.
+
+- **Frame count under animation does not need its own count-saturation correction.** With `BRIDGE_ANIMATED_FRAMES_MAX` aligned to `BRIDGE_SPRITE_SAMPLE_SIZE` and corpus-level `c_i` already weighting redundant frames, animated records do not over-saturate `count_conf` relative to multi-image static records. Don't add intra-asset downweighting "to be safe" — it would require recording per-frame parent-ref grouping at featurization time and a math change in scoring; both have been considered and rejected as not load-bearing.
+
+**Don't** invoke `is_animated_bytes` / `uniform_sample_frames` from match-time code paths — featurization is the single writer. **Don't** populate `image_features` rows under the parent ref of an animated asset; the existence of `<ref>#frame_*` rows is the implicit "this ref is animated" signal that match-time relies on. **Don't** introduce per-asset dedup (scene-detect, hash-based pruning, etc.) — corpus-level dedup via `c_i` is the correct layer for that, and per-asset dedup hurts more than it helps when most assets are loops. **Don't** add HEIF/AVIF support without auditing the §13.8 decode allowlist in `imgmatch/frames.py` and the associated tests. **Don't** add a `ref_expansions` table — synthetic ref strings carry the expansion encoded; cascade purge already covers them via the existing `LIKE '<job_id>:%'` predicate. **Don't** re-fetch asset bytes at match time. The whole point of writing synthetic-ref rows is that match-time reads cached features and never invokes the decoder.
 
 ### 13.9 Calibrated defaults (provenance: [`docs/calibration/CALIBRATION_RESULTS.md`](docs/calibration/CALIBRATION_RESULTS.md))
 
@@ -306,7 +333,14 @@ These are the bridge's calibrated behavior, not deployment-time knobs. Defaults 
 
 **Activation**: gated by `BRIDGE_EMBEDDING_ENABLED=true` AND `embedding` in `BRIDGE_IMAGE_CHANNELS`. When ENABLED is true but `embedding` isn't in the channel list, featurization still computes embeddings (they're cheap to keep) but scoring ignores them.
 
-**Calibration coverage gap**: §13.9's calibrated values were tuned against high-quality Pexels content. On 240p video, single-studio corpora, monochrome film, etc., A/B/C all degrade. D doesn't — that's the entire point. **The right escape hatch when calibrated A/B/C scoring underperforms is to add D, not to change the calibrated values.**
+**Calibration coverage gap**: §13.9's calibrated values were tuned against high-quality natural-image content. On 240p video, single-studio corpora, monochrome film, etc., A/B/C all degrade. D doesn't — that's the entire point. **The right escape hatch when calibrated A/B/C scoring underperforms is to add D, not to change the calibrated values.**
+
+**Zero-shot D quality is corpus-content-bound, not math-bound.** The mean-of-max aggregation works correctly across corpus types. Field observations:
+  - Natural-image corpora where Stash-side and extractor-side images depict the same content (calibration-style): composite scores cluster 0.75–0.98, almost all crossing the scrape threshold.
+  - Static-image-rich curated corpora where each record carries multiple within-scene stills: composite 0.65–0.85, most crossing threshold under sprite mode.
+  - Stylized within-studio corpora where extractor records carry off-scene staged promos rather than within-scene stills: composite 0.45–0.65 even when the human-perceived match is correct, because cosine similarity between a video screenshot and a staged promo of the same performer/scene is genuinely lower than between two within-scene stills. This is a corpus-content gap (the embedding cannot zero-shot reach an arbitrarily-staged promo from a video frame), **not** a bridge bug, and is not fixable at the matching layer. Sprite mode (M=8) reduces but does not close this gap.
+
+**The implication**: the threshold (`BRIDGE_IMAGE_THRESHOLD`) is corpus-shape-dependent. Corpora whose extractor records are within-scene stills clear 0.7 reliably; corpora whose extractor records are staged promos do not. Scrape-mode firing rate on a stylized-promo corpus will be low regardless of any tuning the bridge can do — the right knob is corpus content (request additional within-scene stills upstream) or threshold (lower it for that corpus class, accepting more false-positive fires).
 
 **D-batch invariant** (gated by `embedding ∈ BRIDGE_IMAGE_CHANNELS` AND `BRIDGE_EMBEDDING_ENABLED=true`): when D is in the channel list, every match request runs a single D-batch matmul over **every** candidate (~ms regardless of N) and ranks them. `BRIDGE_EMBEDDING_PREFILTER_K` then chooses what happens next:
 
@@ -514,7 +548,7 @@ Extractor-side rows are never evicted — they're bounded by job count and clear
 | `stash_cover`          | scene oshash + screenshot epoch                 | Bounded by §14.9 LRU eviction             |
 | `stash_sprite`         | scene oshash + frame index                      | Bounded by §14.9 LRU eviction             |
 | `stash_aggregate`      | scene oshash (channel B aggregate)              | Bounded by §14.9 LRU eviction             |
-| `extractor_image`      | `<job_id>:<image_ref>`                          | Cleared by `completed_at` cascade (§14.5) |
+| `extractor_image`      | `<job_id>:<image_ref>` for static, `<job_id>:<image_ref>#frame_<N>` for animated frames (§13.8.1) | Cleared by `completed_at` cascade (§14.5) |
 | `extractor_aggregate`  | `<job_id>:<record_idx>` (channel B aggregate)   | Cleared by `completed_at` cascade (§14.5) |
 
 **Don't** introduce a sixth `source` value without updating the cascade query in §14.5 and the eviction predicate in §14.9.
@@ -543,3 +577,4 @@ While `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=true` (default): every pHash compute wri
 | Featurization stuck at `progress: 0`          | Bridge restart didn't see the row as stale yet — wait `BRIDGE_STALE_TASK_MS` (default 10 min) for auto-recovery, or manually delete the `job_feature_state` row.                                                                                                                              |
 | FK violation on `job_feature_state` insert    | §14.2 — `ensure_job_results_fresh(job)` must run before the gate inserts the state row. Captured by `tests/unit/test_lifecycle.py::TestWorker::test_enqueue_creates_state`.                                                                                                                  |
 | Storage growing without bound                 | §14.9 — LRU eviction loop disabled (`BRIDGE_STASH_FEATURE_BUDGET_BYTES=0`?) or interval too long. Stash-side rows are the unbounded class; extractor-side rows are job-cascade-bound.                                                                                                          |
+| Animated cover / record asset never matches   | §13.8.1 — (a) HEIF/AVIF assets are hard-skipped per §13.8 rule 4; nothing to debug. (b) Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref — if absent, featurization saw the bytes as static (`is_animated_bytes` returned False) or PIL decode failed; treat as decode failure. (c) Average `count(synth_rows) / count(distinct_assets)` should be close to `BRIDGE_ANIMATED_FRAMES_MAX` for a corpus with mostly long animations; values much lower indicate truncated GIFs (rare) or featurization rerun with a stale code version (cache invalidation).                                          |

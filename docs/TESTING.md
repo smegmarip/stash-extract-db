@@ -23,7 +23,12 @@ tests/
 │   │                                 # SearchConfidenceFloor (CLAUDE.md §13.7)
 │   ├── test_embedding.py             # channel D math: cosine sim, fp16 blob round-trip,
 │   │                                 # algorithm-key versioning; GPU-skipped encode tests
-│   └── test_image_match_prefilter.py # D-batch + cached_channels plumbing (CLAUDE.md §13.10)
+│   ├── test_image_match_prefilter.py # D-batch + cached_channels plumbing (CLAUDE.md §13.10)
+│   ├── test_frames.py                # animation-aware decode: format allowlist, GIF/WebP/APNG
+│   │                                 # frame extraction, uniform temporal sampling, HEIF/AVIF skip
+│   │                                 # (CLAUDE.md §13.7/§13.8/§13.8.1)
+│   └── test_imgmatch_animated.py     # synthetic ref expansion, _parent_ref, _resolve_fingerprint_for,
+│                                     # _collapsed_stash_cover_fetcher, prefetched-bytes featurize path
 ├── integration/
 │   └── test_calibration.py           # live harness that walks ground_truth.json against a running bridge
 └── calibration/
@@ -36,7 +41,7 @@ tests/
     └── runs/                         # gitignored — JSONL run-logs
 ```
 
-The unit suite runs without external dependencies (no Stash, no extractor, no network). Run it on every change. Tests in `test_embedding.py::TestEncodeOnGPU` are auto-skipped when CUDA isn't available — they run only on the GPU host. The integration harness and calibration corpus are heavier — used for evaluating scoring quality, not for catching regressions in the inner code.
+The unit suite runs without external dependencies (no Stash, no extractor, no network). Run it on every change. Tests in `test_embedding.py::TestEncodeOnGPU` are auto-skipped when CUDA isn't available — they run only on the GPU host. The rest of the unit suite (including `test_frames.py`) runs unconditionally; PIL is sufficient for both static and animated decode. The integration harness and calibration corpus are heavier — used for evaluating scoring quality, not for catching regressions in the inner code.
 
 ---
 
@@ -128,6 +133,30 @@ D-batch and `cached_channels` plumbing from `bridge/app/matching/image_match.py`
 
 Stubs the embedding-side helpers (`extractor_image_embedding`, `stash_cover_embedding`, `stash_sprite_embeddings`) directly so no DB or HTTP machinery is needed. Live end-to-end checks against a real job are handled by the smoke harness in `scripts/smoke_channel_d.py`.
 
+### 2.9 `test_frames.py` (25 tests)
+
+Animation-aware decode (CLAUDE.md §13.7/§13.8/§13.8.1) from `bridge/app/matching/imgmatch/frames.py`:
+
+- **Format allowlist**: positive identification of `{GIF, WEBP, PNG, JPEG}`. HEIF/AVIF magic bytes return `None` from `load_image_frames` (skip per §13.8 rule 4) regardless of which Pillow plugins happen to be installed in the host. Garbage bytes also return `None`.
+- **`load_image_frames`**: static images return a single-frame list; animated GIF/WebP/APNG return all frames as RGB; `max_frames` caps the output.
+- **`is_animated_bytes`**: discriminates animated from static and from undecodable bytes.
+- **`collapse_stash_cover`**: returns the original bytes unchanged for static input; produces valid still JPEG bytes for animated input (mode `middle` or `median`); returns `None` for unsupported formats.
+- **`uniform_sample_frames`**: returns up to `max_frames` JPEG frame bytes at uniform temporal indices for animated input; returns the single static frame for static input; returns `None` on unsupported format or decode failure. Verifies index spread is non-degenerate (frames are not all identical).
+
+All fixtures are PIL-generated in-test — no external assets, no network.
+
+### 2.10 `test_imgmatch_animated.py` (10 tests)
+
+Animated-asset wiring in `bridge/app/matching/image_match.py` and `featurization.py` (CLAUDE.md §13.7/§13.8.1):
+
+- `_parent_ref` strips `#frame_N` from synthetic refs; static refs pass through.
+- `_resolve_fingerprint_for` uses the parent asset URL for synthetic refs (cohort invalidation under cascade).
+- `_collapsed_stash_cover_fetcher` returns animated bytes collapsed to a single JPEG; static bytes pass through; fetch failures return `None`.
+- `extractor_image_hash` accepts a synthetic ref + `prefetched_bytes` and writes the cached row without invoking the fetcher (the load-bearing contract for the featurization fast path on animated assets).
+- `_expanded_extractor_refs` expands animated parents to their numerically-sorted synthetic frame refs (`frame_2 < frame_10`, not the lexicographic order); mixes static + animated refs cleanly; static-only inputs pass through.
+
+Uses the `bridge_db` fixture for prefix-scan queries; otherwise mocks `ex_client.fetch_asset` and `stash_client.fetch_image_bytes` directly.
+
 ---
 
 ## 3. Integration test — `test_calibration.py`
@@ -203,7 +232,35 @@ The remaining 1 miss + 3 negative-control behaviors are outside the reach of any
 
 ---
 
-## 6. When to run what
+## 6. Field observations — corpus content shape vs match quality
+
+The calibration in §5 fixed the scoring math against one well-behaved corpus class. Manual testing against a wider variety of corpora has surfaced patterns the calibration could not see, because they're properties of the input data rather than the algorithm. These notes do not change defaults; they shape expectations and inform threshold choices in deployment.
+
+### 6.1 Embedding-only zero-shot quality is corpus-content-bound
+
+Sprite mode + channel D embedding-only (`BRIDGE_EMBEDDING_PREFILTER_K=0`) was tested across three structurally distinct corpora. Top-1 composite distribution per class:
+
+| Corpus class                                                                                                      | Top-1 composite | Threshold-fire rate |
+| ----------------------------------------------------------------------------------------------------------------- | --------------- | ------------------- |
+| Natural-image, both sides depicting the same content (calibration-style)                                          | 0.75 – 0.98     | ≈100% over 0.7      |
+| Static-image-rich curated, multiple within-scene stills per record                                                | 0.65 – 0.85     | most over 0.7       |
+| Stylized within-studio, extractor records carry off-scene staged promos rather than within-scene stills           | 0.45 – 0.65     | rarely over 0.7     |
+
+The third class is hard not because the math is wrong but because cosine similarity between a video screenshot and a staged promo of the same performer/scene is genuinely lower than between two within-scene stills. Sprite mode (M=8) reduces but does not close this gap. Lowering the threshold for that corpus class accepts more false-positive fires; the right knob is content (request additional within-scene stills upstream) or threshold per deployment, not the bridge defaults.
+
+### 6.2 Animated extractor assets — uniform sampling vs scene-detect
+
+An earlier implementation used ffmpeg scene-detection to extract frames from animated assets, anticipating scenic content (cuts, motion). In production this collapsed nearly every animated asset to a single frame at the default scene-change threshold — animated assets in real corpora are typically short action loops with no scene cuts, not scenic content. Switching to PIL uniform temporal sampling restored the multi-frame contribution (≈8 frames per asset at the default cap), and corpus-level dedup via `c_i` covers the redundancy concern. See CLAUDE.md §13.8.1 for the invariants.
+
+The mechanical fix did not lift threshold-fire rate on stylized within-studio corpora — the mean-of-max math was correctly exposing that animated frames in such corpora are *also* off-scene staged content, not within-scene moments. This is consistent with §6.1: animated handling is a faithful conduit; it cannot manufacture similarity that isn't in the underlying frames.
+
+### 6.3 What this means for new corpora
+
+Before tuning anything for a new corpus, run a 10–30 scene sample with `?debug=1` and inspect the top-1 composite distribution. If composites cluster ≥0.7, calibration transferred; ship as-is. If composites cluster 0.5–0.65, treat the corpus as the third class above — tune threshold downward for that deployment if the precision/recall trade is acceptable, but understand that a stylized-promo corpus will not reach calibration-class precision regardless of what the bridge does. If composites cluster <0.4 across the board, suspect a featurization or routing bug rather than a content issue, and check `image_features` synth row counts and the debug envelope's `_debug.image.channels.embedding.extractor_refs` to confirm the expected refs are flowing through.
+
+---
+
+## 7. When to run what
 
 | Change                                   | Run                                              |
 | ---------------------------------------- | ------------------------------------------------ |

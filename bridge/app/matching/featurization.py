@@ -17,11 +17,13 @@ from typing import Optional
 import numpy as np
 
 from ..cache import db as cdb
+from ..extractor import client as ex_client
 from ..settings import settings
 from .image_match import (
     extractor_image_hash, extractor_image_bc_features,
     CHANNEL_B_ALGO, CHANNEL_C_ALGO,
 )
+from .imgmatch import frames as _frames
 from .imgmatch.image_comparison import hash_distance_to_similarity
 from .imgmatch.channels import (
     aggregate_color_hist, color_hist_similarity, tone_similarity,
@@ -59,10 +61,11 @@ async def _featurize_inner(job_id: str) -> None:
         logger.info("featurize: no records for job=%s — marking ready empty", job_id)
         return
 
-    # Map: ref string → set of result_index values it appears in. Plus
-    # per-record refs list for B aggregate compute.
-    ref_to_records: dict[str, set[int]] = defaultdict(set)
-    record_refs: dict[int, list[str]] = {}
+    # First pass: collect the original (un-expanded) ref → record-set
+    # mapping. Animated assets get expanded into synthetic frame refs
+    # below, after a fetch+scene-detect pass.
+    original_ref_to_records: dict[str, set[int]] = defaultdict(set)
+    original_record_refs: dict[int, list[str]] = {}
     for rec in records:
         idx = rec["result_index"]
         data = rec["data"] or {}
@@ -71,12 +74,12 @@ async def _featurize_inner(job_id: str) -> None:
         rec_refs: list[str] = []
         for r in [cover, *images]:
             if r and isinstance(r, str):
-                ref_to_records[r].add(idx)
+                original_ref_to_records[r].add(idx)
                 if r not in rec_refs:
                     rec_refs.append(r)
-        record_refs[idx] = rec_refs
+        original_record_refs[idx] = rec_refs
 
-    if not ref_to_records:
+    if not original_ref_to_records:
         logger.info("featurize: no image refs for job=%s — marking ready empty", job_id)
         return
 
@@ -84,45 +87,100 @@ async def _featurize_inner(job_id: str) -> None:
     hash_size = settings.bridge_hash_size
     new_algo_a = _algo_key(algorithm, hash_size)
 
-    refs = list(ref_to_records.keys())
-    total = len(refs)
+    original_refs = list(original_ref_to_records.keys())
+    total = len(original_refs)
     completed = [0]
     sem = asyncio.Semaphore(settings.bridge_featurize_per_job_concurrency)
     ref_hash_a: dict[str, object] = {}     # imagehash objects
     ref_blob_b: dict[str, np.ndarray] = {}  # numpy uint8 hist
     ref_blob_c: dict[str, np.ndarray] = {}  # numpy uint8 tone
+    # Animated refs that expanded — original_ref → ordered list of synthetic refs.
+    expanded: dict[str, list[str]] = {}
 
-    async def featurize_one(ref: str) -> None:
+    async def featurize_one(original_ref: str) -> None:
+        """Fetch the asset once, detect animation, expand if needed, then
+        compute per-channel features per (synthetic) frame ref. Static
+        refs flow through with synth_refs == [original_ref]."""
         async with sem:
             try:
-                h = await extractor_image_hash(job_id, ref, algorithm, hash_size)
+                data = await ex_client.fetch_asset(job_id, original_ref)
             except Exception as e:
-                logger.warning("featurize: hash A failed job=%s ref=%s :: %s", job_id, ref, e)
-                h = None
-            try:
-                bc = await extractor_image_bc_features(job_id, ref)
-            except Exception as e:
-                logger.warning("featurize: B/C compute failed job=%s ref=%s :: %s", job_id, ref, e)
-                bc = {"color_hist": None, "tone": None}
-            # Channel D (semantic embedding) — gated by the feature flag.
-            # Same fetch the bc path uses; result cached in image_features
-            # under channel='embedding'. No baseline/uniqueness needed.
-            if settings.bridge_embedding_enabled:
+                logger.warning("featurize: fetch failed job=%s ref=%s :: %s",
+                               job_id, original_ref, e)
+                data = None
+
+            if data and await asyncio.to_thread(_frames.is_animated_bytes, data):
+                frame_bytes_list = await asyncio.to_thread(
+                    _frames.uniform_sample_frames, data,
+                    max_frames=settings.bridge_animated_frames_max,
+                )
+                if not frame_bytes_list:
+                    # Animated but decode produced no frames → treat as
+                    # decode failure per §13.8 rule 1: skip.
+                    completed[0] += 1
+                    await cdb.set_feature_progress(job_id, 0.80 * (completed[0] / total))
+                    return
+                synth_pairs = [
+                    (f"{original_ref}#frame_{i}", fb)
+                    for i, fb in enumerate(frame_bytes_list)
+                ]
+                expanded[original_ref] = [s for s, _ in synth_pairs]
+            else:
+                # Static asset (data may be None — let downstream fetch
+                # try again and cache the failure sentinel).
+                synth_pairs = [(original_ref, data)]
+
+            for synth_ref, frame_bytes in synth_pairs:
                 try:
-                    from .image_match import extractor_image_embedding
-                    await extractor_image_embedding(job_id, ref)
+                    h = await extractor_image_hash(
+                        job_id, synth_ref, algorithm, hash_size,
+                        prefetched_bytes=frame_bytes,
+                    )
                 except Exception as e:
-                    logger.warning("featurize: embedding compute failed job=%s ref=%s :: %s", job_id, ref, e)
+                    logger.warning("featurize: hash A failed job=%s ref=%s :: %s",
+                                   job_id, synth_ref, e)
+                    h = None
+                try:
+                    bc = await extractor_image_bc_features(
+                        job_id, synth_ref, prefetched_bytes=frame_bytes,
+                    )
+                except Exception as e:
+                    logger.warning("featurize: B/C compute failed job=%s ref=%s :: %s",
+                                   job_id, synth_ref, e)
+                    bc = {"color_hist": None, "tone": None}
+                if settings.bridge_embedding_enabled:
+                    try:
+                        from .image_match import extractor_image_embedding
+                        await extractor_image_embedding(
+                            job_id, synth_ref, prefetched_bytes=frame_bytes,
+                        )
+                    except Exception as e:
+                        logger.warning("featurize: embedding compute failed job=%s ref=%s :: %s",
+                                       job_id, synth_ref, e)
+                if h is not None:
+                    ref_hash_a[synth_ref] = h
+                if bc.get("color_hist") is not None:
+                    ref_blob_b[synth_ref] = np.frombuffer(bc["color_hist"][0], dtype=np.uint8)
+                if bc.get("tone") is not None:
+                    ref_blob_c[synth_ref] = np.frombuffer(bc["tone"][0], dtype=np.uint8)
+
         completed[0] += 1
         await cdb.set_feature_progress(job_id, 0.80 * (completed[0] / total))
-        if h is not None:
-            ref_hash_a[ref] = h
-        if bc.get("color_hist") is not None:
-            ref_blob_b[ref] = np.frombuffer(bc["color_hist"][0], dtype=np.uint8)
-        if bc.get("tone") is not None:
-            ref_blob_c[ref] = np.frombuffer(bc["tone"][0], dtype=np.uint8)
 
-    await asyncio.gather(*(featurize_one(ref) for ref in refs))
+    await asyncio.gather(*(featurize_one(ref) for ref in original_refs))
+
+    # Now build the post-expansion ref↔record mappings used by aggregate /
+    # baseline / uniqueness compute. Each animated original ref contributes
+    # its synthetic frame refs in the same record-index slot.
+    ref_to_records: dict[str, set[int]] = defaultdict(set)
+    record_refs: dict[int, list[str]] = {idx: [] for idx in original_record_refs}
+    for original_ref, rec_set in original_ref_to_records.items():
+        synth_list = expanded.get(original_ref, [original_ref])
+        for synth in synth_list:
+            for idx in rec_set:
+                ref_to_records[synth].add(idx)
+                if synth not in record_refs[idx]:
+                    record_refs[idx].append(synth)
 
     # Per-record B aggregate. Keyed by (job_id, record_idx) using the
     # extractor_aggregate source/ref convention from §2.1.

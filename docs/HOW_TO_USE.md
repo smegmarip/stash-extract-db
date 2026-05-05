@@ -16,7 +16,7 @@ This document is task-oriented. If you only want to scrape one scene and verify 
 | **Python** (for the scraper)       | 3.8+             | The Stash scraper script is stdlib-only — no `pip install` needed beyond what the scraper requirements file pins. |
 | **`sqlite3` CLI** (optional)       | any              | Useful for inspecting the bridge's cache during troubleshooting.                                                  |
 
-The bridge image (`Dockerfile`) installs its own Python deps (FastAPI, Pillow, imagehash, numpy, rapidfuzz, etc.) — you don't need a host-side Python venv to run it.
+The bridge image (`Dockerfile`) installs its own Python deps (FastAPI, Pillow, imagehash, numpy, rapidfuzz, etc.) — you don't need a host-side Python venv to run it. Animated extractor assets are decoded via PIL (uniform temporal sampling, CLAUDE.md §13.8.1); no system binaries beyond standard Python image tooling are required.
 
 ---
 
@@ -364,6 +364,7 @@ For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the sym
 | Scoring same scene differently after restart                 | `corpus_stats` regenerated — baseline shifts slightly. Expected; absolute scores not stable across re-featurization, but ranks should be.                                   |
 | Bridge unresponsive (`/health` timing out) during heavy work | Possible regression of the asyncio.to_thread fix — see CLAUDE.md §14.4. Run `pytest tests/unit/test_lifecycle.py::TestEventLoopResponsiveness`.                             |
 | Need to nuke everything and start fresh                      | `docker compose down -v` won't delete `./data/`. Do `rm -rf ./data && docker compose up -d --build`.                                                                        |
+| Animated cover/asset never matches                           | Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref. If absent, featurization saw the bytes as static or PIL decode failed; treat as decode failure. HEIF/AVIF are hard-skipped by design (CLAUDE.md §13.8.1).   |
 
 ---
 
@@ -392,6 +393,8 @@ Every environment variable consumed by the bridge or `docker-compose.yml`, in tw
 | `BRIDGE_STASH_FEATURE_BUDGET_BYTES`    | `1073741824` (1 GB)                | LRU eviction budget for Stash-side `image_features` rows. Set `0` to disable eviction. Extractor-side rows are job-cascade-bound, never LRU.                                                   |
 | `BRIDGE_LRU_EVICTION_INTERVAL_S`       | `3600` (1 hour)                    | How often the LRU eviction loop runs.                                                                                                                                                          |
 | `BRIDGE_LEGACY_DUAL_WRITE_ENABLED`     | `true`                             | While `true`, every pHash compute writes to both `image_hashes` (legacy) and `image_features`; reads check features first, fall back to legacy. Flip `false` to retire the legacy path (§7.3). |
+| `BRIDGE_ANIMATED_FRAMES_MAX`           | `8`                                | Cap on extractor-side uniform-sampled frames per animated asset (CLAUDE.md §13.8.1). Mirrors `BRIDGE_SPRITE_SAMPLE_SIZE` so animated records don't blow out `count_conf`. Frames are picked at uniform temporal indices; corpus-level dedup is via `c_i`.       |
+| `BRIDGE_ANIMATED_COVER_MODE`           | `middle`                           | Stash-cover collapse for animated screenshots. `middle` picks the temporal middle frame (one real frame); `median` produces a per-pixel median across frames (synthetic, robust to outliers but ghosts on motion). |
 
 ### 9.2 Calibrated — empirically derived, change with evidence
 

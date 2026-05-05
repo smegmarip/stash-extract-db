@@ -557,3 +557,36 @@ async def list_extractor_image_refs(job_id: str) -> list[str]:
         async for row in cur:
             out.append(row[0])
     return out
+
+
+async def list_frame_refs_for_extractor_ref(job_id: str, ref: str) -> list[str]:
+    """Return the synthetic frame refs persisted for an animated extractor
+    asset. Empty list when the ref is static (or never featurized).
+
+    Synthetic refs are stored as `<job_id>:<ref>#frame_N` in image_features.
+    This helper strips the `<job_id>:` prefix and returns refs in the same
+    form they appear in record.data (so match-time iteration over
+    expanded refs is uniform with iteration over original refs).
+    """
+    prefix_full = f"{job_id}:{ref}#frame_"
+    prefix_ref = f"{ref}#frame_"
+    out: list[str] = []
+    async with db().execute(
+        "SELECT DISTINCT ref_id FROM image_features "
+        "WHERE source='extractor_image' AND ref_id LIKE ? "
+        "ORDER BY ref_id",
+        (f"{prefix_full}%",),
+    ) as cur:
+        async for row in cur:
+            ref_id = row[0]
+            if not ref_id.startswith(f"{job_id}:"):
+                continue
+            out.append(ref_id[len(job_id) + 1:])
+    # Sort by frame index numerically — lexicographic gives frame_10 < frame_2
+    def _idx(r: str) -> int:
+        try:
+            return int(r[len(prefix_ref):])
+        except (ValueError, IndexError):
+            return 0
+    out.sort(key=_idx)
+    return out
