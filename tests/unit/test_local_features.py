@@ -20,9 +20,9 @@ class TestAlgorithmKey:
     def test_format_includes_model_max_kp_and_dtype(self, clean_settings):
         lf._ALGO_KEY = None
         clean_settings.bridge_local_feature_max_keypoints = 512
-        clean_settings.bridge_local_feature_model = "superpoint"
+        clean_settings.bridge_local_feature_model = "disk"
         key = lf.algorithm_key()
-        assert "superpoint" in key
+        assert "disk" in key
         assert "N=512" in key
         # dtype suffix is fp16 on cuda, fp32 on cpu — assert one of them
         assert "fp16" in key or "fp32" in key
@@ -44,7 +44,7 @@ class TestAlgorithmKey:
 # --- Blob serialization round-trip ---------------------------------------
 
 class TestBlobRoundTrip:
-    def _make_synthetic_lf(self, n: int, d: int = 256, seed: int = 0) -> dict:
+    def _make_synthetic_lf(self, n: int, d: int = 128, seed: int = 0) -> dict:
         rng = np.random.default_rng(seed)
         return {
             "keypoints": rng.uniform(0, 480, (n, 2)).astype(np.float16),
@@ -64,23 +64,23 @@ class TestBlobRoundTrip:
 
     def test_blob_size_matches_formula(self):
         # Header (12) + N*(2 fp16 kpts + 1 fp16 score + D*2 fp16 desc bytes)
-        # For N=512, D=256: 12 + 512 * (4 + 2 + 512) = 12 + 512*518 = 265228
+        # For N=512, D=128: 12 + 512 * (4 + 2 + 256) = 12 + 512*262 = 134156
         original = self._make_synthetic_lf(n=512)
         blob = lf.lf_to_blob(original)
-        expected = 12 + 512 * (4 + 2 + 256 * 2)
+        expected = 12 + 512 * (4 + 2 + 128 * 2)
         assert len(blob) == expected
 
     def test_empty_keypoints_round_trip(self):
         empty = {
             "keypoints": np.zeros((0, 2), dtype=np.float16),
             "scores": np.zeros(0, dtype=np.float16),
-            "descriptors": np.zeros((0, 256), dtype=np.float16),
+            "descriptors": np.zeros((0, 128), dtype=np.float16),
             "image_hw": (100, 100),
         }
         blob = lf.lf_to_blob(empty)
         back = lf.blob_to_lf(blob)
         assert back["keypoints"].shape == (0, 2)
-        assert back["descriptors"].shape == (0, 256)
+        assert back["descriptors"].shape == (0, 128)
         assert back["scores"].shape == (0,)
         assert back["image_hw"] == (100, 100)
 
@@ -99,7 +99,7 @@ class TestBlobRoundTrip:
         bad = {
             "keypoints": np.zeros((10, 2), dtype=np.float16),
             "scores": np.zeros(10, dtype=np.float16),
-            "descriptors": np.zeros((10, 128), dtype=np.float16),  # wrong dim
+            "descriptors": np.zeros((10, 256), dtype=np.float16),  # wrong dim (DISK is 128)
             "image_hw": (100, 100),
         }
         with pytest.raises(ValueError):

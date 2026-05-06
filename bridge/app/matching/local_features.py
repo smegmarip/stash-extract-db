@@ -1,19 +1,26 @@
-"""Channel E: local-feature matching via SuperPoint + LightGlue.
+"""Channel E: local-feature matching via DISK + LightGlue.
 
 Where Channel D (embedding) compresses an image to a single global vector,
-Channel E preserves local correspondences: SuperPoint detects keypoints and
-emits per-keypoint descriptors; LightGlue matches keypoints across two
-images; RANSAC fits a homography to the matches and reports the inlier
-count. The inlier count is what survives viewpoint shift, so E targets
-the failure class where D's holistic representation drops below threshold
-on same-scene-different-angle pairs.
+Channel E preserves local correspondences: DISK detects keypoints and emits
+per-keypoint descriptors; LightGlue matches keypoints across two images;
+RANSAC fits a homography to the matches and reports the inlier count. The
+inlier count is what survives viewpoint shift, so E targets the failure
+class where D's holistic representation drops below threshold on
+same-scene-different-angle pairs.
+
+DISK over SuperPoint: kornia 0.8.x dropped SuperPoint (Magic Leap BSD-3
+licensing). DISK is the kornia-native replacement and is actually a
+better fit for E's use case — DISK is trained with a multi-view
+consistency objective on depth-pair datasets, which is closer to our
+"same scene, different camera" target than SuperPoint's SLAM-style
+adjacent-frame training.
 
 Stored in `image_features` with `channel='keypoints'` and a versioned
-`algorithm` string ('superpoint:N=<max_kp>:fp16'). Cascade invalidation
+`algorithm` string ('disk:N=<max_kp>:fp16'). Cascade invalidation
 (extractor-side) reuses the existing source taxonomy — no schema change.
 
-See CLAUDE.md §13.E (to be added) for invariants and `docs/CHANNEL_E_PLAN.md`
-for the implementation plan.
+See CLAUDE.md §13.E for invariants and `docs/CHANNEL_E_PLAN.md` for the
+implementation plan.
 """
 from __future__ import annotations
 
@@ -32,21 +39,21 @@ from ..settings import settings
 logger = logging.getLogger(__name__)
 
 
-# Lazy-loaded singletons. SuperPoint + LightGlue both live in process
-# memory for the lifetime of the bridge. Combined VRAM ~50MB fp16.
+# Lazy-loaded singletons. DISK + LightGlue both live in process memory
+# for the lifetime of the bridge. Combined VRAM ~50MB fp16.
 _EXTRACTOR = None
 _MATCHER = None
 _ALGO_KEY: Optional[str] = None
 _LOAD_LOCK = threading.Lock()
 
 # Internal preprocessing: resize each input image's longer side to this
-# value before SuperPoint extraction. Stable runtime cost; SuperPoint's
-# detection density doesn't gain much from larger inputs at this scale.
+# value before DISK extraction. Stable runtime cost; DISK's detection
+# density doesn't gain much from larger inputs at this scale.
 _INPUT_LONGER_SIDE = 640
 
-# Descriptor dimension for SuperPoint. Hardcoded — changing this requires
-# a different extractor.
-_DESC_DIM = 256
+# Descriptor dimension for DISK. 128-d (DISK default). Hardcoded;
+# changing requires a different extractor.
+_DESC_DIM = 128
 
 
 # -- Device + dtype resolution (mirrors embedding.py) ----------------------
@@ -70,7 +77,7 @@ def _resolve_device() -> str:
 
 
 def _resolve_dtype():
-    """SuperPoint + LightGlue run fp32 on CPU (no fp16 win there) and fp16
+    """DISK + LightGlue run fp32 on CPU (no fp16 win there) and fp16
     on GPU (faster, halves VRAM)."""
     import torch
     device = _resolve_device()
@@ -81,7 +88,7 @@ def _resolve_dtype():
 
 def algorithm_key() -> str:
     """Versioned algorithm string for image_features rows.
-    Example: 'superpoint:N=512:fp16'.
+    Example: 'disk:N=512:fp16'.
 
     A change in `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS` or model produces
     a fresh key; old rows survive until cascade or LRU eviction.
@@ -99,11 +106,12 @@ def algorithm_key() -> str:
 # -- Model loading ---------------------------------------------------------
 
 def _load_models():
-    """Lazily load SuperPoint + LightGlue. Idempotent.
+    """Lazily load DISK + LightGlue. Idempotent.
 
-    Both come from `kornia.feature`. First call downloads weights to the
-    HF cache (small; <50MB combined). Subsequent calls hit the fast path
-    before acquiring the lock.
+    Both come from `kornia.feature`. DISK's `from_pretrained("depth")`
+    downloads ~4MB weights to the torch hub cache on first call; LightGlue
+    follows suit. Subsequent calls hit the fast path before acquiring
+    the lock.
     """
     global _EXTRACTOR, _MATCHER
     if _EXTRACTOR is not None and _MATCHER is not None:
@@ -117,18 +125,18 @@ def _load_models():
         # Imported lazily so the module can be imported on hosts that
         # don't have kornia installed (e.g. CPU-only test environments
         # that run without the local_features extra).
-        from kornia.feature import SuperPoint, LightGlueMatcher
+        from kornia.feature import DISK, LightGlueMatcher
 
         device = _resolve_device()
         dtype = _resolve_dtype()
         max_kp = settings.bridge_local_feature_max_keypoints
         logger.info(
-            "local_features: loading SuperPoint + LightGlue device=%s dtype=%s max_kp=%d",
+            "local_features: loading DISK + LightGlue device=%s dtype=%s max_kp=%d",
             device, dtype, max_kp,
         )
 
-        extractor = SuperPoint(num_features=max_kp).eval().to(device).to(dtype)
-        matcher = LightGlueMatcher("superpoint").eval().to(device).to(dtype)
+        extractor = DISK.from_pretrained("depth").eval().to(device).to(dtype)
+        matcher = LightGlueMatcher("disk").eval().to(device).to(dtype)
 
         _EXTRACTOR = extractor
         _MATCHER = matcher
@@ -138,10 +146,14 @@ def _load_models():
 
 # -- Encode (image bytes → keypoints, scores, descriptors) -----------------
 
-def _decode_to_grayscale_tensor(data: bytes):
-    """Decode image bytes → torch tensor (1, 1, H, W) grayscale, normalized
+def _decode_to_rgb_tensor(data: bytes):
+    """Decode image bytes → torch tensor (1, 3, H, W) RGB, normalized
     to [0, 1]. Resizes longer side to _INPUT_LONGER_SIDE while preserving
     aspect ratio. Returns None on decode failure.
+
+    Pads H, W to be multiples of 16 — DISK's UNet has 4 downsampling
+    stages; non-multiple-of-16 inputs raise a shape-mismatch error inside
+    the U-Net's skip connections.
     """
     import torch
     try:
@@ -151,25 +163,33 @@ def _decode_to_grayscale_tensor(data: bytes):
         logger.warning("local_features: PIL decode failed :: %s", e)
         return None
 
-    if img.mode != "L":
-        img = img.convert("L")
+    if img.mode != "RGB":
+        img = img.convert("RGB")
 
     w, h = img.size
     longer = max(w, h)
     if longer != _INPUT_LONGER_SIDE:
         scale = _INPUT_LONGER_SIDE / longer
-        new_w = max(1, int(round(w * scale)))
-        new_h = max(1, int(round(h * scale)))
+        new_w = max(16, int(round(w * scale)))
+        new_h = max(16, int(round(h * scale)))
         img = img.resize((new_w, new_h), Image.BILINEAR)
 
-    arr = np.asarray(img, dtype=np.float32) / 255.0
-    t = torch.from_numpy(arr).unsqueeze(0).unsqueeze(0)  # (1, 1, H, W)
+    # Pad to multiple of 16 for DISK's U-Net.
+    w, h = img.size
+    pad_w = (16 - w % 16) % 16
+    pad_h = (16 - h % 16) % 16
+    if pad_w or pad_h:
+        from PIL import ImageOps
+        img = ImageOps.expand(img, border=(0, 0, pad_w, pad_h), fill=0)
+
+    arr = np.asarray(img, dtype=np.float32) / 255.0   # (H, W, 3)
+    t = torch.from_numpy(arr).permute(2, 0, 1).unsqueeze(0)  # (1, 3, H, W)
     return t
 
 
 def _extract_sync(data: bytes) -> Optional[dict]:
-    """Synchronous: decode bytes → SuperPoint extraction → dict of
-    {keypoints, scores, descriptors, image_size}.
+    """Synchronous: decode bytes → DISK extraction → dict of
+    {keypoints, scores, descriptors, image_hw}.
 
     Returns None on decode failure. Callers must dispatch via
     `asyncio.to_thread` (CLAUDE.md §14.4 — CPU/GPU compute off the
@@ -177,7 +197,7 @@ def _extract_sync(data: bytes) -> Optional[dict]:
     """
     import torch
 
-    t = _decode_to_grayscale_tensor(data)
+    t = _decode_to_rgb_tensor(data)
     if t is None:
         return None
 
@@ -187,32 +207,20 @@ def _extract_sync(data: bytes) -> Optional[dict]:
     t = t.to(device).to(dtype)
 
     H, W = t.shape[-2], t.shape[-1]
-    with torch.no_grad():
-        out = extractor(t)
-        # kornia.SuperPoint output shape varies slightly across versions.
-        # Normalize to (kpts: (N,2), scores: (N,), descs: (N, D)).
-        if isinstance(out, dict):
-            kpts = out["keypoints"]
-            scores = out["scores"]
-            descs = out["descriptors"]
-        else:
-            # Tuple form (kpts, scores, descs).
-            kpts, scores, descs = out
-
-    # Drop batch dimension if present.
-    if kpts.dim() == 3:
-        kpts = kpts[0]
-    if scores.dim() == 2:
-        scores = scores[0]
-    if descs.dim() == 3:
-        descs = descs[0]
-
-    # Normalize descriptor shape — some kornia versions return (D, N).
-    if descs.dim() == 2 and descs.shape[0] == _DESC_DIM and descs.shape[1] != _DESC_DIM:
-        descs = descs.t()
-
-    # Truncate to max_keypoints by score desc.
     max_kp = settings.bridge_local_feature_max_keypoints
+    with torch.no_grad():
+        # DISK returns a list[DISKFeatures] — one entry per batch image.
+        # Each has .keypoints (N,2), .descriptors (N, D), .detection_scores (N,).
+        feats = extractor(t, n=max_kp, window_size=5)
+
+    if not feats:
+        return None
+    f = feats[0]
+    kpts = f.keypoints.detach()
+    scores = f.detection_scores.detach()
+    descs = f.descriptors.detach()
+
+    # `n=max_kp` already caps; this is belt-and-braces.
     if scores.shape[0] > max_kp:
         topk = torch.topk(scores, k=max_kp, largest=True, sorted=True)
         kpts = kpts[topk.indices]
@@ -220,9 +228,9 @@ def _extract_sync(data: bytes) -> Optional[dict]:
         descs = descs[topk.indices]
 
     return {
-        "keypoints": kpts.detach().to("cpu").to(torch.float16).numpy(),
-        "scores": scores.detach().to("cpu").to(torch.float16).numpy(),
-        "descriptors": descs.detach().to("cpu").to(torch.float16).numpy(),
+        "keypoints": kpts.to("cpu").to(torch.float16).numpy(),
+        "scores": scores.to("cpu").to(torch.float16).numpy(),
+        "descriptors": descs.to("cpu").to(torch.float16).numpy(),
         "image_hw": (int(H), int(W)),
     }
 
@@ -341,8 +349,8 @@ def match_pair_sync(query_lf: dict, ref_lf: dict) -> int:
 
     q_h, q_w = query_lf.get("image_hw", (0, 0))
     r_h, r_w = ref_lf.get("image_hw", (0, 0))
-    hw_q = torch.tensor([[q_h, q_w]], device=device, dtype=torch.float32) if q_h else None
-    hw_r = torch.tensor([[r_h, r_w]], device=device, dtype=torch.float32) if r_h else None
+    hw_q = (int(q_h), int(q_w)) if q_h else None
+    hw_r = (int(r_h), int(r_w)) if r_h else None
 
     with torch.no_grad():
         try:

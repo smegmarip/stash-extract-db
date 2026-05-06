@@ -15,12 +15,12 @@ from bridge.app.matching.scoring import ChannelScore, compose
 
 
 def _stub_lf_blob(n: int = 32) -> bytes:
-    """Build a deserializable LF blob with N keypoints."""
+    """Build a deserializable LF blob with N keypoints (DISK 128-d descriptors)."""
     rng = np.random.default_rng(0)
     fake = {
         "keypoints": rng.uniform(0, 480, (n, 2)).astype(np.float16),
         "scores": rng.uniform(0, 1, n).astype(np.float16),
-        "descriptors": rng.uniform(-1, 1, (n, 256)).astype(np.float16),
+        "descriptors": rng.uniform(-1, 1, (n, 128)).astype(np.float16),
         "image_hw": (480, 640),
     }
     return lf.lf_to_blob(fake)

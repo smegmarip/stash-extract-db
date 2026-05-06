@@ -367,14 +367,16 @@ For the legacy A/B/C-only path (no embedding in channels), K is ignored and sing
 - **Don't** apply A/B/C-style sharpening or count-saturation to channel D. Cosine similarity is already in [-1, 1] and corpus-independent — sharpening it against a per-job baseline reintroduces the calibration problem D was created to avoid.
 - **Don't** put A/B/C-style `c_i` weights on D embeddings. Repeated images in a record contribute their own embedding similarity each time; the average gives them appropriate weight. Adding c_i correction would double-count the dedup-safety the embedding space already provides.
 
-### 13.E Channel E: local-feature matching (SuperPoint + LightGlue)
+### 13.E Channel E: local-feature matching (DISK + LightGlue)
 
-> **Where channel D compresses an image to a single global vector, channel E preserves local correspondences. SuperPoint detects keypoints + descriptors; LightGlue matches them across two images; RANSAC homography reports the inlier count. The inlier count is what survives viewpoint shift, so E targets the failure class where D's holistic representation drops below threshold on same-scene-different-angle pairs.**
+> **Where channel D compresses an image to a single global vector, channel E preserves local correspondences. DISK detects keypoints + descriptors; LightGlue matches them across two images; RANSAC homography reports the inlier count. The inlier count is what survives viewpoint shift, so E targets the failure class where D's holistic representation drops below threshold on same-scene-different-angle pairs.**
+
+**DISK over SuperPoint**: kornia 0.8.x dropped SuperPoint (Magic Leap BSD-3 weights re-licensing). DISK is the kornia-native replacement and is actually a better fit for E's use case — DISK is trained with a multi-view consistency objective on depth-pair datasets, which is closer to our "same scene, different camera" target than SuperPoint's SLAM-style adjacent-frame training. 128-d descriptors (vs 256-d for SuperPoint) halve the per-image storage budget.
 
 **Why E exists alongside D**: D's CLS-token cosine similarity drops sharply when extractor-side and Stash-side images of the same content differ in camera angle, lens, or resolution — even though all the structural cues (faces, costume patterns, set decor) are still present in both frames. Local features survive that gap because they're anchored to specific corners and textures rather than holistic composition. E is the "is this geometrically the same scene" verifier that complements D's "is this conceptually similar content" recall.
 
 **Compute path**:
-1. **Featurize**: per-image keypoints + descriptors via SuperPoint (default 512 keypoints, 256-d descriptors fp16). Stored in `image_features` with `channel='keypoints'` and `algorithm='superpoint:N=<max_kp>:fp16'`. Per-image storage ~260 KB at 512 keypoints.
+1. **Featurize**: per-image keypoints + descriptors via DISK (default 512 keypoints, 128-d descriptors fp16). Stored in `image_features` with `channel='keypoints'` and `algorithm='disk:N=<max_kp>:fp16'`. Per-image storage ~135 KB at 512 keypoints.
 2. **Match-time** (top-K only — see activation): for each (record_image, stash_frame) pair, LightGlue produces matches; kornia RANSAC fits a homography and reports inlier count.
 3. **Compose**: `S_E = clip(max_pair_inliers / target_inliers, 0, 1)` if `max_pair_inliers ≥ min_inliers`, else 0. Joins the existing `compose()` math as a fired channel — `composite = max(fired) + bonus * (n_fired - 1)`.
 
@@ -388,7 +390,7 @@ For the legacy A/B/C-only path (no embedding in channels), K is ignored and sing
 
 **Latency**: a single `match_pair` is ~30–50 ms on GPU. At K=10, N=5 record images, M=8 sprite frames the worst case is K × N × M × 40 ms ≈ 16 s. The two-pass pre-filter bounds this; the sprite-pruning optimization (one pair per record_image, picked by D's `per_image_max`) drops it to ~K × N × 40 ms ≈ 2 s and is ready to pull if validation lifts precision but latency hurts. Phase 5 follow-up, not Phase 1–4.
 
-**Storage**: ~260 KB/image at the default 512 max_keypoints. Halves to ~130 KB at 256 keypoints with negligible quality loss for matching. Cascade invalidation reuses the existing `extractor_image` source taxonomy — no schema change, no new cascade query.
+**Storage**: ~135 KB/image at the default 512 max_keypoints (DISK's 128-d descriptors). Halves again to ~70 KB at 256 keypoints with negligible quality loss for matching. Cascade invalidation reuses the existing `extractor_image` source taxonomy — no schema change, no new cascade query.
 
 **Don'ts**:
 - **Don't** apply sharpening, count-saturation, distribution-shape, or `c_i` to E. Inlier counts are corpus-independent; the calibration mechanism A/B/C need would re-introduce the per-corpus dependency E was created to avoid (same logic as §13.10's argument for D).

@@ -79,9 +79,9 @@ class Settings(BaseSettings):
     # See CLAUDE.md §13.E (to be added) for invariants and
     # docs/CHANNEL_E_PLAN.md for the implementation plan.
     bridge_local_features_enabled: bool = False
-    bridge_local_feature_model: str = "superpoint"   # currently the only option
+    bridge_local_feature_model: str = "disk"          # DISK is kornia's native multi-view-trained extractor; SuperPoint dropped from kornia 0.8.x
     bridge_local_feature_device: str = "auto"         # auto | cuda | cpu
-    bridge_local_feature_max_keypoints: int = 512     # SuperPoint paper default
+    bridge_local_feature_max_keypoints: int = 512     # paper-default for DISK + SuperPoint alike
     bridge_local_feature_min_inliers: int = 15        # "fires" gate; below this S_E=0
     bridge_local_feature_target_inliers: int = 50     # S_E saturation point
     bridge_local_feature_ransac_thresh: float = 5.0   # pixels, RANSAC reproj threshold

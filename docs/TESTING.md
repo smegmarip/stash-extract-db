@@ -29,7 +29,7 @@ tests/
 │   │                                 # (CLAUDE.md §13.7/§13.8/§13.8.1)
 │   ├── test_imgmatch_animated.py     # synthetic ref expansion, _parent_ref, _resolve_fingerprint_for,
 │   │                                 # _collapsed_stash_cover_fetcher, prefetched-bytes featurize path
-│   ├── test_local_features.py        # channel E (SuperPoint+LightGlue): algorithm-key versioning,
+│   ├── test_local_features.py        # channel E (DISK+LightGlue): algorithm-key versioning,
 │   │                                 # blob serialization round-trip, GPU-skipped encode/match smoke
 │   ├── test_image_match_channel_e.py # score_image_channel_e shape: empty-side returns 0, below
 │   │                                 # min_inliers no-fire, max-across-pairs, composite math with E

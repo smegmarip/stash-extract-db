@@ -433,11 +433,11 @@ These are the bridge's calibrated behavior, sourced from a 491-video Pexels corp
 | `BRIDGE_EMBEDDING_BATCH_SIZE`                 | `16`                        | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                                               |
 | `BRIDGE_EMBEDDING_THRESHOLD`                  | `0.7`                       | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                                               |
 | `BRIDGE_EMBEDDING_PREFILTER_K`                | `10`                        | `K>0`: two-pass — D ranks all candidates in one matmul, A/B/C re-score top-K. `K=0`: embedding-only — A/B/C compute skipped entirely (fastest). See §10.5.                              |
-| `BRIDGE_LOCAL_FEATURES_ENABLED`               | `false`                     | Channel E (SuperPoint + LightGlue local-feature matching). Disabled by default; flip to `true` and add `local_features` to `BRIDGE_IMAGE_CHANNELS` to engage. See §11 + CLAUDE.md §13.E.|
-| `BRIDGE_LOCAL_FEATURE_MODEL`                  | `superpoint`                | Currently the only option. Reserved for future extractors (ALIKED, DISK).                                                                                                              |
+| `BRIDGE_LOCAL_FEATURES_ENABLED`               | `false`                     | Channel E (DISK + LightGlue local-feature matching). Disabled by default; flip to `true` and add `local_features` to `BRIDGE_IMAGE_CHANNELS` to engage. See §11 + CLAUDE.md §13.E.|
+| `BRIDGE_LOCAL_FEATURE_MODEL`                  | `disk`                      | DISK (kornia-native, multi-view-trained). SuperPoint dropped from kornia 0.8.x for licensing reasons.                                                                                  |
 | `BRIDGE_LOCAL_FEATURE_DEVICE`                 | `auto`                      | `auto` / `cuda` / `cpu`. Mirrors `BRIDGE_EMBEDDING_DEVICE`.                                                                                                                              |
-| `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS`          | `512`                       | SuperPoint paper default. Storage scales linearly: ~260 KB/image at 512, ~130 KB at 256.                                                                                                |
-| `BRIDGE_LOCAL_FEATURE_MIN_INLIERS`            | `15`                        | RANSAC inlier count below which Channel E does not fire (S=0). Tuned for SuperPoint+LightGlue+RANSAC self-match floor; lower values produce false fires on unrelated images.            |
+| `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS`          | `512`                       | DISK keypoint cap. Storage scales linearly: ~135 KB/image at 512 (128-d descriptors), ~70 KB at 256.                                                                                   |
+| `BRIDGE_LOCAL_FEATURE_MIN_INLIERS`            | `15`                        | RANSAC inlier count below which Channel E does not fire (S=0). Tuned for DISK+LightGlue+RANSAC self-match floor; lower values produce false fires on unrelated images.                  |
 | `BRIDGE_LOCAL_FEATURE_TARGET_INLIERS`         | `50`                        | Inlier count where S_E saturates at 1.0. Computed as `clip(max_inliers / target_inliers, 0, 1)` once min_inliers is met.                                                                |
 | `BRIDGE_LOCAL_FEATURE_RANSAC_THRESH`          | `5.0`                       | RANSAC reprojection threshold (pixels). Tighter values reject more candidate inliers; looser values accept more spurious ones.                                                          |
 | `DOCKER_RUNTIME` _(compose)_                  | `nvidia`                    | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).                                            |
@@ -530,9 +530,9 @@ When `embedding` is not in `BRIDGE_IMAGE_CHANNELS`, K is ignored and the legacy 
 
 ---
 
-## 11. Channel E: local-feature matching (SuperPoint + LightGlue)
+## 11. Channel E: local-feature matching (DISK + LightGlue)
 
-For corpora where channel D ranks the right candidate at top-1 but the global-embedding cosine sits below threshold — same scene, different camera angle / lens / resolution — local-feature matching adds geometric corroboration that survives viewpoint shift. Channel E uses SuperPoint (kornia) for keypoint extraction, LightGlue for matching, and RANSAC homography to count inliers.
+For corpora where channel D ranks the right candidate at top-1 but the global-embedding cosine sits below threshold — same scene, different camera angle / lens / resolution — local-feature matching adds geometric corroboration that survives viewpoint shift. Channel E uses DISK (kornia) for keypoint extraction, LightGlue for matching, and RANSAC homography to count inliers. DISK is kornia 0.8.x's native multi-view-trained extractor (chosen over SuperPoint, which kornia dropped in 0.8.x for licensing reasons).
 
 See [`CLAUDE.md`](../CLAUDE.md) §13.E for the architectural invariants and [`docs/CHANNEL_E_PLAN.md`](CHANNEL_E_PLAN.md) for the implementation/validation plan.
 
@@ -550,7 +550,7 @@ docker compose build stash-extract-db                # picks up the kornia dep
 docker compose up -d --force-recreate stash-extract-db
 ```
 
-First boot adds ~50 MB of SuperPoint + LightGlue weights to the existing `huggingface_cache` volume; subsequent recreates reuse it. Featurization for any non-`ready` job recomputes — adds ~25–50 s per ~500-record job on CUDA, several minutes on CPU. You'll see fresh 503s on `/match/*` until featurization completes (CLAUDE.md §14 contract).
+First boot adds ~50 MB of DISK + LightGlue weights to the torch hub cache (DISK ~4 MB, LightGlue-disk ~45 MB); subsequent recreates reuse it. Featurization for any non-`ready` job recomputes — adds ~25–50 s per ~500-record job on CUDA, several minutes on CPU. You'll see fresh 503s on `/match/*` until featurization completes (CLAUDE.md §14 contract).
 
 ### 11.2 Gating: K must be > 0
 
@@ -569,17 +569,17 @@ Expected fields: `S` (0 or in `[min_inliers/target_inliers, 1]`), `max_inliers`,
 
 ### 11.4 Latency expectations
 
-A single `match_pair` is ~30–50 ms on a recent CUDA GPU. At default K=10, N=5 record images, M=8 sprite frames the worst case is K × N × M × 40 ms ≈ 16 s per request — bounded by the existing two-pass prefilter so it never scales with corpus size. CPU-only hosts run roughly 5–10× slower; the request will exceed Stash's default 90 s scraper timeout if combined corpus + N + M is large.
+A single `match_pair` is ~30–50 ms on a recent CUDA GPU (DISK + LightGlue + kornia RANSAC). At default K=10, N=5 record images, M=8 sprite frames the worst case is K × N × M × 40 ms ≈ 16 s per request — bounded by the existing two-pass prefilter so it never scales with corpus size. CPU-only hosts run roughly 5–10× slower; the request will exceed Stash's default 90 s scraper timeout if combined corpus + N + M is large.
 
 If precision lifts but latency hurts, the sprite-pruning optimization (one pair per record_image, picked by D's `per_image_max`) drops worst-case to ~K × N × 40 ms ≈ 2 s. Not in the minimum-shippable; tracked in `CHANNEL_E_PLAN.md` Phase 5.
 
 ### 11.5 CPU fallback
 
-`BRIDGE_LOCAL_FEATURE_DEVICE=cpu` works — kornia's SuperPoint and LightGlue have CPU paths, just slower. Featurization moves from ~25 s to several minutes per ~500-record job; per-request E adds ~150–500 ms per pair instead of ~50 ms. For dev/eval where the GPU isn't allocated to the bridge.
+`BRIDGE_LOCAL_FEATURE_DEVICE=cpu` works — kornia's DISK and LightGlue have CPU paths, just slower. Featurization moves from ~25 s to several minutes per ~500-record job; per-request E adds ~150–500 ms per pair instead of ~50 ms. For dev/eval where the GPU isn't allocated to the bridge.
 
 ### 11.6 Storage and rollback
 
-Storage at default 512 max_keypoints: ~260 KB/image. Halve to ~130 KB by setting `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS=256` — slight quality loss for matching, acceptable for most corpora. Cascade invalidation reuses the existing `extractor_image` source (CLAUDE.md §15.2), so per-job clear works without code change.
+Storage at default 512 max_keypoints: ~135 KB/image (DISK 128-d descriptors). Halve to ~70 KB by setting `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS=256` — slight quality loss for matching, acceptable for most corpora. Cascade invalidation reuses the existing `extractor_image` source (CLAUDE.md §15.2), so per-job clear works without code change.
 
 Rollback: flip `BRIDGE_LOCAL_FEATURES_ENABLED=false`. Existing `keypoints` rows survive but are inert (no scoring path reaches them) until cascade-invalidated. To reclaim storage immediately:
 

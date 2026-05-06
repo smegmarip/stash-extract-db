@@ -1,4 +1,4 @@
-# Channel E — Local feature matching (SuperPoint + LightGlue)
+# Channel E — Local feature matching (DISK + LightGlue)
 
 > Transient implementation plan. To be folded into CLAUDE.md §13 + TESTING.md and deleted on merge per `MEMORY.md` planning-doc lifecycle.
 
@@ -11,7 +11,7 @@ D-only path (K=0) is unchanged. A/B/C remain on the legacy no-embedding path for
 ## Scope
 
 **In scope** (minimum-shippable):
-- SuperPoint extraction at featurize-time → keypoints + descriptors stored in `image_features`.
+- DISK extraction at featurize-time → keypoints + descriptors stored in `image_features`.
 - LightGlue + RANSAC homography at match-time, scoped to top-K candidates per `BRIDGE_EMBEDDING_PREFILTER_K`.
 - Composite math: `max(S_D, S_E) + bonus * (n_fired - 1)` (re-uses existing `compose()`).
 - New settings, `?debug=1` exposure, unit tests.
@@ -25,7 +25,7 @@ D-only path (K=0) is unchanged. A/B/C remain on the legacy no-embedding path for
 
 ## Library
 
-**kornia** (`kornia.feature.SuperPoint`, `kornia.feature.LightGlue`). Same VRAM as cvg/LightGlue (~50 MB combined, dwarfed by DINOv2-L's ~700 MB + activations). One pip dep, RANSAC utilities included. cvg/LightGlue would be the upstream alternative — pick later if kornia's release cadence becomes a problem.
+**kornia** (`kornia.feature.DISK`, `kornia.feature.LightGlueMatcher`, `kornia.geometry.RANSAC`). DISK over SuperPoint because kornia 0.8.x dropped SuperPoint (Magic Leap BSD-3 weights re-licensing) and DISK is the kornia-native replacement — and is actually a *better* fit for E's use case since DISK's training objective (multi-view consistency on depth-pair datasets) is closer to "same scene, different camera" than SuperPoint's SLAM-style adjacent-frame training. ~50 MB combined VRAM, dwarfed by DINOv2-L's ~700 MB + activations. cvg/LightGlue is the upstream alternative if SuperPoint becomes essential later.
 
 ## Architecture
 
@@ -34,13 +34,13 @@ D-only path (K=0) is unchanged. A/B/C remain on the legacy no-embedding path for
 For each image (extractor record images, Stash sprite frames, Stash cover) when `BRIDGE_LOCAL_FEATURES_ENABLED=true`:
 
 1. Decode bytes → grayscale tensor (HW1).
-2. SuperPoint forward → `(N_kp, 2)` keypoints (xy float) + `(N_kp, 256)` descriptors.
+2. DISK forward → `(N_kp, 2)` keypoints (xy float) + `(N_kp, 128)` descriptors.
 3. Truncate to `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS` by score, descending.
 4. Serialize: `keypoints fp16 + scores fp16 + descriptors fp16` → single blob, length-prefixed.
 5. Store in `image_features`:
    - `source` = existing taxonomy (`extractor_image`, `stash_cover`, `stash_sprite`)
    - `channel = 'keypoints'`
-   - `algorithm = 'superpoint:N={max_kp}:fp16'`
+   - `algorithm = 'disk:N={max_kp}:fp16'`
 
 Cascade invalidation, animated `#frame_N` expansion, `_expanded_extractor_refs` — all unchanged. Channel E inherits the existing per-channel storage contract.
 
@@ -72,9 +72,9 @@ E "fires" when `S_E >= min_contribution` (existing 0.05). Below that, E contribu
 
 | Layer | Budget |
 |---|---|
-| Featurize per image (SuperPoint fwd) | ~30–80 ms GPU |
-| Storage per image (512 kp × 256 desc fp16) | ~260 KB |
-| Total storage on a 3000-image corpus | ~800 MB |
+| Featurize per image (DISK fwd) | ~30–80 ms GPU |
+| Storage per image (512 kp × 128 desc fp16) | ~135 KB |
+| Total storage on a 3000-image corpus | ~400 MB |
 | Featurize wall-clock per ~500-record job | +25–50 s |
 | Match-time per (record_image, stash_frame) pair (LightGlue + RANSAC) | ~30–50 ms |
 | Worst-case match-time at K=10, N=5 record images, M=8 sprite frames | K × N × M × 40 ms ≈ 16 s |
@@ -88,9 +88,9 @@ New (in `bridge/app/settings.py` under the operational/calibrated split):
 | Setting | Default | Group | Notes |
 |---|---|---|---|
 | `BRIDGE_LOCAL_FEATURES_ENABLED` | `false` | operational | Master toggle. Off by default. |
-| `BRIDGE_LOCAL_FEATURE_MODEL` | `superpoint` | operational | Future: aliked, disk. |
+| `BRIDGE_LOCAL_FEATURE_MODEL` | `disk` | operational | Currently the only option. SuperPoint dropped from kornia 0.8.x; ALIKED is a future possibility. |
 | `BRIDGE_LOCAL_FEATURE_DEVICE` | `auto` | operational | Mirrors `BRIDGE_EMBEDDING_DEVICE`. |
-| `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS` | `512` | calibrated | Storage/quality knob. SuperPoint paper default. |
+| `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS` | `512` | calibrated | Storage/quality knob. DISK keypoint cap; ~135 KB/image at 512. |
 | `BRIDGE_LOCAL_FEATURE_MIN_INLIERS` | `15` | calibrated | "Fires" threshold. Below this, S_E ≈ 0. |
 | `BRIDGE_LOCAL_FEATURE_RANSAC_THRESH` | `5.0` | calibrated | Pixels, RANSAC reprojection threshold. |
 | `BRIDGE_LOCAL_FEATURE_TARGET_INLIERS` | `50` | calibrated | S_E saturation point. |
@@ -119,7 +119,7 @@ Re-uses `BRIDGE_EMBEDDING_PREFILTER_K` for top-K selection — same K controls b
 ### Phase 3 — Tests — ~½ day
 
 - [ ] `tests/unit/test_local_features.py`:
-  - SuperPoint encode round-trip on synthetic image (deterministic on same input).
+  - DISK encode round-trip on synthetic image (deterministic on same input).
   - Blob serialization round-trip preserves keypoints + descriptors at fp16.
   - `match_pair` on identical image returns N >> threshold inliers.
   - `match_pair` on unrelated images returns ~0 inliers.
