@@ -136,7 +136,13 @@ def _load_models():
         )
 
         extractor = DISK.from_pretrained("depth").eval().to(device).to(dtype)
-        matcher = LightGlueMatcher("disk").eval().to(device).to(dtype)
+        # LightGlue is held in fp32 even on GPU. Its scatter ops mix fp16
+        # and fp32 tensors internally, which raises
+        # "Index put requires the source and destination dtypes match"
+        # when the matcher is cast to fp16. The matcher is cheap relative
+        # to the inference dominated by DISK extraction, so the fp32 cost
+        # is negligible.
+        matcher = LightGlueMatcher("disk").eval().to(device).to(torch.float32)
 
         _EXTRACTOR = extractor
         _MATCHER = matcher
@@ -329,7 +335,9 @@ def match_pair_sync(query_lf: dict, ref_lf: dict) -> int:
 
     _ext, matcher = _load_models()
     device = next(matcher.parameters()).device
-    dtype = next(matcher.parameters()).dtype
+    # LightGlue is fp32 (see _load_models comment); feed it fp32 tensors
+    # to avoid the dtype-mismatch scatter error.
+    dtype = torch.float32
 
     # Build input tensors. LightGlueMatcher in kornia consumes
     # descriptor + LAF (local affine frame) tensors.
