@@ -563,6 +563,172 @@ async def stash_sprite_embeddings(
     return out
 
 
+# --- Channel E: local-feature (SuperPoint) cache-or-compute helpers --------
+
+async def _keypoints_or_compute(
+    source: str, ref_id: str, fingerprint: str, fetcher,
+    prefetched_bytes: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """Channel-E equivalent of `_embedding_or_compute`. Reads or computes
+    the keypoints+descriptors blob for one image. Returns the raw blob or
+    None on unrecoverable failure. Negative-cache sentinels prevent retry.
+    """
+    from . import local_features as lf
+
+    if not fingerprint:
+        return None
+    algo = lf.algorithm_key()
+
+    cached = await cdb.get_image_feature(source, ref_id, fingerprint, "keypoints", algo)
+    if cached is not None:
+        return bytes(cached[0])
+    if await cdb.is_feature_attempt_cached(source, ref_id, fingerprint, "keypoints", algo):
+        return None
+
+    data = prefetched_bytes if prefetched_bytes is not None else await fetcher()
+    if not data:
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "keypoints", algo)
+        return None
+
+    feat = await lf.encode_bytes_async(data)
+    if feat is None or feat["keypoints"].shape[0] == 0:
+        await cdb.set_feature_attempt_failed(source, ref_id, fingerprint, "keypoints", algo)
+        return None
+
+    blob = lf.lf_to_blob(feat)
+    # Quality field carries the mean keypoint score — useful as a debug
+    # signal for "how textured was this image". L2 norm for D is the
+    # analog; mean detection score for E is the equivalent.
+    import numpy as _np
+    quality = float(_np.asarray(feat["scores"], dtype=_np.float32).mean()) if feat["scores"].size else 0.0
+    await cdb.set_image_feature(
+        source, ref_id, fingerprint, "keypoints", algo, blob, quality,
+    )
+    return blob
+
+
+async def extractor_image_keypoints(
+    job_id: str, ref: str,
+    *, prefetched_bytes: Optional[bytes] = None,
+) -> Optional[bytes]:
+    """Channel E keypoints blob for one extractor image. Accepts synthetic
+    frame refs `<ref>#frame_N` (CLAUDE.md §13.7/§13.8.1)."""
+    if not ref:
+        return None
+    parent = _parent_ref(ref)
+    full_url = ex_client.resolve_asset_url(job_id, parent) if not parent.startswith("http") else parent
+    return await _keypoints_or_compute(
+        "extractor_image", f"{job_id}:{ref}", full_url,
+        lambda: ex_client.fetch_asset(job_id, parent),
+        prefetched_bytes=prefetched_bytes,
+    )
+
+
+async def stash_cover_keypoints(scene: dict[str, Any]) -> Optional[bytes]:
+    """Channel E keypoints for the scene's cover screenshot."""
+    paths = scene.get("paths") or {}
+    url = paths.get("screenshot") or ""
+    if not url:
+        return None
+    fingerprint = _screenshot_fingerprint(url) or url
+    return await _keypoints_or_compute(
+        "stash_cover", scene["id"], fingerprint,
+        lambda: _collapsed_stash_cover_fetcher(url),
+    )
+
+
+async def stash_sprite_keypoints(
+    scene: dict[str, Any], sample_size: int,
+) -> list[Optional[bytes]]:
+    """Channel E keypoints per sprite frame. Returns list of length
+    sample_size; entries may be None for frames whose decode/extract failed.
+    Cached per-frame at (`scene_id:idx`, oshash). Mirrors the structure of
+    `stash_sprite_embeddings`.
+    """
+    from . import local_features as lf
+    from .imgmatch.sprite_processor import (
+        parse_vtt, decode_vtt_text, extract_sprite_frames, sample_frames,
+    )
+
+    paths = scene.get("paths") or {}
+    sprite_url = paths.get("sprite") or ""
+    vtt_url = paths.get("vtt") or ""
+    oshash = _scene_oshash(scene)
+    if not sprite_url or not vtt_url or not oshash:
+        return []
+
+    algo = lf.algorithm_key()
+
+    # Try cache per-frame.
+    out: list[Optional[bytes]] = []
+    cached_count = 0
+    sentinel_count = 0
+    for idx in range(sample_size):
+        ref_id = f"{scene['id']}:{idx}"
+        feat = await cdb.get_image_feature("stash_sprite", ref_id, oshash, "keypoints", algo)
+        if feat is not None:
+            out.append(bytes(feat[0]))
+            cached_count += 1
+            continue
+        if await cdb.is_feature_attempt_cached("stash_sprite", ref_id, oshash, "keypoints", algo):
+            out.append(None)
+            sentinel_count += 1
+            continue
+        out = []
+        break
+
+    if out and (cached_count + sentinel_count) == sample_size:
+        return out
+
+    # Cache miss — fetch sprite + VTT once, decode + extract per-frame.
+    sprite_bytes = await stash_client.fetch_image_bytes(sprite_url)
+    vtt_text = await stash_client.fetch_text(vtt_url)
+    if not sprite_bytes or not vtt_text:
+        return []
+
+    def _decode_and_sample():
+        sprite_img = Image.open(io.BytesIO(sprite_bytes))
+        vtt_frames = parse_vtt(decode_vtt_text(vtt_text))
+        if not vtt_frames:
+            return None
+        extracted = extract_sprite_frames(sprite_img, vtt_frames)
+        return sample_frames(extracted, sample_size)
+
+    try:
+        sampled = await asyncio.to_thread(_decode_and_sample)
+        if sampled is None:
+            return []
+    except Exception as e:
+        logger.warning("sprite keypoints decode failed for scene %s :: %s", scene.get("id"), e)
+        return []
+
+    out = []
+    for idx in range(len(sampled)):
+        ref_id = f"{scene['id']}:{idx}"
+        # Re-encode each frame to JPEG bytes so encode_bytes_async can
+        # decode + resize uniformly. Slight overhead, but isolates the
+        # local_features module from PIL specifics.
+        frame_pil = sampled[idx]["image"]
+        buf = io.BytesIO()
+        frame_pil.convert("L").save(buf, format="JPEG", quality=92)
+        frame_bytes = buf.getvalue()
+        feat = await lf.encode_bytes_async(frame_bytes)
+        if feat is None or feat["keypoints"].shape[0] == 0:
+            await cdb.set_feature_attempt_failed(
+                "stash_sprite", ref_id, oshash, "keypoints", algo,
+            )
+            out.append(None)
+            continue
+        blob = lf.lf_to_blob(feat)
+        import numpy as _np
+        quality = float(_np.asarray(feat["scores"], dtype=_np.float32).mean()) if feat["scores"].size else 0.0
+        await cdb.set_image_feature(
+            "stash_sprite", ref_id, oshash, "keypoints", algo, blob, quality,
+        )
+        out.append(blob)
+    return out
+
+
 async def stash_sprite_bc_features(
     scene: dict[str, Any], sample_size: int,
 ) -> list[dict[str, Optional[tuple[bytes, float]]]]:
@@ -1377,6 +1543,127 @@ async def score_image_channel_d_batch(
     return results
 
 
+async def score_image_channel_e(
+    scene: dict[str, Any],
+    job_id: str,
+    record: dict[str, Any],
+    image_mode: str,
+    sprite_sample_size: int,
+) -> dict[str, Any]:
+    """Channel E: local-feature matching (SuperPoint + LightGlue + RANSAC).
+    Returns the dict shape consumed by score_image_composite.
+
+    For each (record_image, stash_frame) pair we count RANSAC homography
+    inliers; the channel score is the maximum across all pairs, normalized
+    by `target_inliers`. Below `min_inliers` the channel does not fire.
+
+      S_E = clip(max_pair_inliers / target_inliers, 0, 1)   if max ≥ min_inliers
+      S_E = 0                                                 otherwise
+
+    Per CLAUDE.md §11, missing data on either side neutralizes — never
+    penalizes. A pair with no cached keypoints contributes 0 inliers,
+    not a negative penalty.
+
+    See docs/CHANNEL_E_PLAN.md §13.E.2 for aggregation provenance.
+    """
+    from . import local_features as lf
+
+    # Extractor-side keypoint blobs (cached from featurization).
+    refs: list[str] = list(record.get("images") or [])
+    cover = record.get("cover_image")
+    if cover and cover not in refs:
+        refs = [cover] + refs
+    refs = await _expanded_extractor_refs(job_id, refs)
+
+    extractor_lfs: list[tuple[str, dict]] = []
+    for ref in refs:
+        try:
+            blob = await extractor_image_keypoints(job_id, ref)
+        except Exception as e:
+            logger.warning("score E: extractor kpts failed job=%s ref=%s :: %s", job_id, ref, e)
+            blob = None
+        if blob is None:
+            continue
+        try:
+            extractor_lfs.append((ref, lf.blob_to_lf(blob)))
+        except Exception as e:
+            logger.warning("score E: blob deserialize failed ref=%s :: %s", ref, e)
+            continue
+    N = len(extractor_lfs)
+
+    # Stash-side keypoint blobs (computed lazily on first call, cached after).
+    stash_lfs: list[dict] = []
+    if image_mode in ("cover", "both"):
+        cb = await stash_cover_keypoints(scene)
+        if cb is not None:
+            try:
+                stash_lfs.append(lf.blob_to_lf(cb))
+            except Exception as e:
+                logger.warning("score E: stash cover kpts deserialize failed :: %s", e)
+    if image_mode in ("sprite", "both"):
+        sprite_blobs = await stash_sprite_keypoints(scene, sprite_sample_size)
+        for sb in sprite_blobs:
+            if sb is None:
+                continue
+            try:
+                stash_lfs.append(lf.blob_to_lf(sb))
+            except Exception:
+                continue
+    M = len(stash_lfs)
+
+    if N == 0 or M == 0:
+        return {
+            "S": 0.0,
+            "max_inliers": 0,
+            "n_inliers_per_pair": [],
+            "extractor_refs": [r for r, _ in extractor_lfs],
+            "n_extractor_images": N,
+            "n_stash_hashes": M,
+            "scoring": "local_features",
+        }
+
+    min_inliers = settings.bridge_local_feature_min_inliers
+    target_inliers = max(1, settings.bridge_local_feature_target_inliers)
+
+    # Pair-iterate. The cost is N*M LightGlue forward passes — bounded by
+    # K (top-K candidates) since this is called inside score_image_composite,
+    # which is itself only invoked on top-K by the K>0 prefilter (CLAUDE.md
+    # §13.10). Phase 5 optimization: pick the best (record_image, stash_frame)
+    # pair via D's per_image_max instead of running all N*M pairs.
+    n_inliers_per_pair: list[list[int]] = []
+    max_inliers = 0
+    for ref, ext_lf in extractor_lfs:
+        row: list[int] = []
+        for s_lf in stash_lfs:
+            try:
+                inliers = await lf.match_pair_async(ext_lf, s_lf)
+            except Exception as e:
+                logger.warning("score E: match_pair failed ref=%s :: %s", ref, e)
+                inliers = 0
+            row.append(int(inliers))
+            if inliers > max_inliers:
+                max_inliers = inliers
+        n_inliers_per_pair.append(row)
+
+    if max_inliers < min_inliers:
+        S = 0.0
+    else:
+        S = max_inliers / target_inliers
+        S = min(1.0, max(0.0, S))
+
+    return {
+        "S": S,
+        "max_inliers": max_inliers,
+        "min_inliers": min_inliers,
+        "target_inliers": target_inliers,
+        "n_inliers_per_pair": n_inliers_per_pair,
+        "extractor_refs": [r for r, _ in extractor_lfs],
+        "n_extractor_images": N,
+        "n_stash_hashes": M,
+        "scoring": "local_features",
+    }
+
+
 async def score_image_composite(
     scene: dict[str, Any],
     job_id: str,
@@ -1451,6 +1738,19 @@ async def score_image_composite(
         channel_scores["embedding"] = ChannelScore(
             S=d["S"], E=0.0, count_conf=1.0, dist_q=1.0,
             m_primes=d.get("per_image_max", []),
+        )
+
+    if "local_features" in channels:
+        # Channel E: only computed when explicitly listed AND the bridge
+        # has it enabled. The compose() math is generic — E joins as just
+        # another fired channel with S in [0, 1].
+        e = await score_image_channel_e(
+            scene, job_id, record, image_mode, sprite_sample_size,
+        )
+        per_channel_debug["local_features"] = e
+        channel_scores["local_features"] = ChannelScore(
+            S=e["S"], E=0.0, count_conf=1.0, dist_q=1.0,
+            m_primes=[],
         )
 
     composite, fired = compose(channel_scores, min_contribution, bonus_per_extra)

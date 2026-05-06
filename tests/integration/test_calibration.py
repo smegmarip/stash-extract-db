@@ -166,6 +166,32 @@ def find_rank_of_expected(ranked: list[dict], expected_record_id: str) -> Option
     return None
 
 
+def load_fixture(path: Path) -> list[dict]:
+    """Load a JSONL fixture for non-Pexels validation runs (e.g. RLS).
+
+    Fixture format: one JSON object per line, with at minimum a
+    `scene_id` (str). Optional fields:
+      - expected_record_id: str            — the right answer; used for p@1
+      - expected_record_index: int         — display-only
+      - negative_control: bool             — flips into the negative bucket
+      - video_basename: str                — display-only
+
+    Lines starting with `#` and blank lines are ignored.
+    """
+    out: list[dict] = []
+    with path.open() as f:
+        for line in f:
+            s = line.strip()
+            if not s or s.startswith("#"):
+                continue
+            entry = json.loads(s)
+            if "scene_id" not in entry:
+                raise ValueError(f"fixture entry missing scene_id: {s!r}")
+            entry["scene_id"] = str(entry["scene_id"])
+            out.append(entry)
+    return out
+
+
 def run_calibration(
     bridge_url: str,
     stash_url: str,
@@ -175,52 +201,103 @@ def run_calibration(
     label: str = "",
     scan_path: str = "/data/calibration/",
     debug: bool = False,
+    fixture: Optional[list[dict]] = None,
 ) -> tuple[RunMetrics, Path]:
     """Run a calibration sweep with `params`, write a JSONL run-log to
-    `runs_dir`. Returns (metrics, run_log_path)."""
-    gt_path = dataset_dir / "ground_truth.json"
-    if not gt_path.is_file():
-        raise FileNotFoundError(f"ground truth not found at {gt_path}")
-    gt = json.loads(gt_path.read_text())
-    gt_by_basename = {e["video_basename"]: e for e in gt}
+    `runs_dir`. Returns (metrics, run_log_path).
 
-    scenes = list_calibration_scenes(stash_url, scan_path)
-    pairs: list[PairResult] = []
+    Two discovery modes:
+      - `fixture` provided: iterate over fixture entries directly. Each
+        entry's `scene_id` is queried; ground truth comes from the
+        fixture row (`expected_record_id`, `negative_control`, ...).
+        Used for non-Pexels validation (e.g. RLS).
+      - `fixture` is None: existing path — scan Stash by `scan_path` to
+        discover calibration scenes, look up ground truth in
+        `dataset_dir/ground_truth.json` by `video_basename`. Used for
+        the Pexels regression check.
+    """
+    if fixture is not None:
+        # Fixture-driven mode: scene ids come from the fixture; no Stash
+        # path scan, no ground_truth.json.
+        pairs: list[PairResult] = []
+        for entry in fixture:
+            scene_id = entry["scene_id"]
+            ranked = query_match(bridge_url, scene_id, params, debug=debug)
+            basename = entry.get("video_basename") or ""
+            gt_entry = entry
+            if isinstance(ranked, dict) and "_error" in ranked:
+                pairs.append(PairResult(
+                    scene_id=scene_id, video_basename=basename,
+                    expected_record_id=gt_entry.get("expected_record_id"),
+                    expected_record_index=gt_entry.get("expected_record_index"),
+                    negative_control=bool(gt_entry.get("negative_control")),
+                    actual_record_id=None, actual_score=None, actual_image_S=None,
+                    rank_of_expected=None, n_results=0,
+                    error=str(ranked),
+                ))
+                continue
+            ranked = ranked if isinstance(ranked, list) else []
+            top = ranked[0] if ranked else None
+            actual_S = None
+            if top and "_debug" in top:
+                actual_S = (top["_debug"].get("image") or {}).get("composite")
+            pairs.append(PairResult(
+                scene_id=scene_id, video_basename=basename,
+                expected_record_id=gt_entry.get("expected_record_id"),
+                expected_record_index=gt_entry.get("expected_record_index"),
+                negative_control=bool(gt_entry.get("negative_control")),
+                actual_record_id=(top or {}).get("Code"),
+                actual_score=(top or {}).get("match_score"),
+                actual_image_S=actual_S,
+                rank_of_expected=find_rank_of_expected(
+                    ranked, gt_entry.get("expected_record_id") or ""
+                ),
+                n_results=len(ranked),
+            ))
+    else:
+        gt_path = dataset_dir / "ground_truth.json"
+        if not gt_path.is_file():
+            raise FileNotFoundError(f"ground truth not found at {gt_path}")
+        gt = json.loads(gt_path.read_text())
+        gt_by_basename = {e["video_basename"]: e for e in gt}
 
-    for s in scenes:
-        files = s.get("files") or []
-        basename = files[0]["basename"] if files else ""
-        gt_entry = gt_by_basename.get(basename, {})
+        scenes = list_calibration_scenes(stash_url, scan_path)
+        pairs = []
 
-        ranked = query_match(bridge_url, s["id"], params, debug=debug)
-        if isinstance(ranked, dict) and "_error" in ranked:
+        for s in scenes:
+            files = s.get("files") or []
+            basename = files[0]["basename"] if files else ""
+            gt_entry = gt_by_basename.get(basename, {})
+
+            ranked = query_match(bridge_url, s["id"], params, debug=debug)
+            if isinstance(ranked, dict) and "_error" in ranked:
+                pairs.append(PairResult(
+                    scene_id=s["id"], video_basename=basename,
+                    expected_record_id=gt_entry.get("expected_record_id"),
+                    expected_record_index=gt_entry.get("expected_record_index"),
+                    negative_control=bool(gt_entry.get("negative_control")),
+                    actual_record_id=None, actual_score=None, actual_image_S=None,
+                    rank_of_expected=None, n_results=0,
+                    error=str(ranked),
+                ))
+                continue
+
+            ranked = ranked if isinstance(ranked, list) else []
+            top = ranked[0] if ranked else None
+            actual_S = None
+            if top and "_debug" in top:
+                actual_S = (top["_debug"].get("image") or {}).get("composite")
             pairs.append(PairResult(
                 scene_id=s["id"], video_basename=basename,
                 expected_record_id=gt_entry.get("expected_record_id"),
                 expected_record_index=gt_entry.get("expected_record_index"),
                 negative_control=bool(gt_entry.get("negative_control")),
-                actual_record_id=None, actual_score=None, actual_image_S=None,
-                rank_of_expected=None, n_results=0,
-                error=str(ranked),
+                actual_record_id=(top or {}).get("Code"),
+                actual_score=(top or {}).get("match_score"),
+                actual_image_S=actual_S,
+                rank_of_expected=find_rank_of_expected(ranked, gt_entry.get("expected_record_id") or ""),
+                n_results=len(ranked),
             ))
-            continue
-
-        ranked = ranked if isinstance(ranked, list) else []
-        top = ranked[0] if ranked else None
-        actual_S = None
-        if top and "_debug" in top:
-            actual_S = (top["_debug"].get("image") or {}).get("composite")
-        pairs.append(PairResult(
-            scene_id=s["id"], video_basename=basename,
-            expected_record_id=gt_entry.get("expected_record_id"),
-            expected_record_index=gt_entry.get("expected_record_index"),
-            negative_control=bool(gt_entry.get("negative_control")),
-            actual_record_id=(top or {}).get("Code"),
-            actual_score=(top or {}).get("match_score"),
-            actual_image_S=actual_S,
-            rank_of_expected=find_rank_of_expected(ranked, gt_entry.get("expected_record_id") or ""),
-            n_results=len(ranked),
-        ))
 
     metrics = RunMetrics.from_pair_results(pairs)
 
@@ -339,6 +416,37 @@ def test_find_rank_of_expected():
     assert find_rank_of_expected([], "a") is None
 
 
+def test_load_fixture_parses_jsonl(tmp_path):
+    """Self-test: load_fixture handles JSONL with comments + blank lines."""
+    p = tmp_path / "rls.jsonl"
+    p.write_text(
+        "# RLS fixture\n"
+        "\n"
+        '{"scene_id": "15173", "expected_record_id": "rec_a"}\n'
+        '{"scene_id": "15177", "expected_record_id": "rec_b", "negative_control": false}\n'
+        '{"scene_id": "9999", "negative_control": true}\n'
+    )
+    fixture = load_fixture(p)
+    assert len(fixture) == 3
+    assert fixture[0]["scene_id"] == "15173"
+    assert fixture[2]["negative_control"] is True
+
+
+def test_load_fixture_rejects_missing_scene_id(tmp_path):
+    p = tmp_path / "bad.jsonl"
+    p.write_text('{"expected_record_id": "rec_a"}\n')
+    with pytest.raises(ValueError, match="scene_id"):
+        load_fixture(p)
+
+
+def test_load_fixture_coerces_int_scene_id(tmp_path):
+    """Stash scene IDs are usually strings, but JSON ints should be ok."""
+    p = tmp_path / "int.jsonl"
+    p.write_text('{"scene_id": 15173, "expected_record_id": "rec_a"}\n')
+    fixture = load_fixture(p)
+    assert fixture[0]["scene_id"] == "15173"
+
+
 # --- CLI entry point (for ad-hoc runs outside pytest) --------------------
 
 def main() -> int:
@@ -360,6 +468,20 @@ def main() -> int:
     p.add_argument("--threshold", type=float)
     p.add_argument("--min-contribution", type=float)
     p.add_argument("--bonus-per-extra", type=float)
+    p.add_argument(
+        "--image-channels",
+        help="Comma-separated channel list passed through into request "
+             "body's `image_channels` field (e.g. embedding,local_features). "
+             "If omitted, default_params() is used.",
+    )
+    p.add_argument(
+        "--fixture",
+        type=Path,
+        help="Path to a JSONL fixture (one {scene_id, expected_record_id, ...} "
+             "per line). When set, skips the scan_path / ground_truth.json "
+             "discovery path and queries the fixture's scene_ids directly. "
+             "Used for non-Pexels validation (RLS, etc.).",
+    )
     args = p.parse_args()
 
     params = default_params()
@@ -373,6 +495,17 @@ def main() -> int:
         v = getattr(args, cli_name, None)
         if v is not None:
             params[body_name] = v
+    if args.image_channels:
+        params["image_channels"] = [
+            c.strip() for c in args.image_channels.split(",") if c.strip()
+        ]
+
+    fixture = None
+    if args.fixture:
+        if not args.fixture.is_file():
+            raise SystemExit(f"fixture not found: {args.fixture}")
+        fixture = load_fixture(args.fixture)
+        print(f"loaded fixture: {len(fixture)} entries from {args.fixture}")
 
     print(f"running calibration: {params}")
     metrics, run_path = run_calibration(
@@ -384,6 +517,7 @@ def main() -> int:
         label=args.label,
         scan_path=args.scan_path,
         debug=args.debug,
+        fixture=fixture,
     )
     print(f"\n{json.dumps(asdict(metrics), indent=2)}")
     print(f"\nrun-log: {run_path}")

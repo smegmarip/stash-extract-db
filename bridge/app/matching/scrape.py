@@ -110,9 +110,10 @@ async def scrape(
                 }
                 for c in cands_to_score
             }
+            rerank_label = "A/B/C/E" if (image_channels and "local_features" in image_channels) else "A/B/C"
             logger.info(
-                "scrape: tier=image two-pass D-batch n=%d → A/B/C re-rank top_k=%d",
-                n_cand, len(cands_to_score),
+                "scrape: tier=image two-pass D-batch n=%d → %s re-rank top_k=%d",
+                n_cand, rerank_label, len(cands_to_score),
             )
         else:
             logger.info(

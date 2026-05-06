@@ -70,6 +70,22 @@ class Settings(BaseSettings):
     # See CLAUDE.md §13.10 for the D-batch invariant.
     bridge_embedding_prefilter_k: int = 10
 
+    # --- Channel E: local-feature matching (SuperPoint + LightGlue).
+    # Disabled by default. When enabled, featurization computes per-image
+    # keypoints + descriptors stored in image_features rows with
+    # channel='keypoints'. Match-time scoring runs LightGlue + RANSAC
+    # homography on the K>0 prefilter's top-K candidates and produces
+    # an additive composite contribution from the inlier count.
+    # See CLAUDE.md §13.E (to be added) for invariants and
+    # docs/CHANNEL_E_PLAN.md for the implementation plan.
+    bridge_local_features_enabled: bool = False
+    bridge_local_feature_model: str = "superpoint"   # currently the only option
+    bridge_local_feature_device: str = "auto"         # auto | cuda | cpu
+    bridge_local_feature_max_keypoints: int = 512     # SuperPoint paper default
+    bridge_local_feature_min_inliers: int = 15        # "fires" gate; below this S_E=0
+    bridge_local_feature_target_inliers: int = 50     # S_E saturation point
+    bridge_local_feature_ransac_thresh: float = 5.0   # pixels, RANSAC reproj threshold
+
     @property
     def image_channels(self) -> list[str]:
         return [c.strip() for c in self.bridge_image_channels.split(",") if c.strip()]

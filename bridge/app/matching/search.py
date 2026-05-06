@@ -42,7 +42,8 @@ def _stash_basename(scene: dict[str, Any]) -> str:
 def _round_channel_debug(channel_name: str, d: dict[str, Any]) -> dict[str, Any]:
     """Format a channel's debug dict for the JSON response. Different
     shapes per channel — frame-level (A, C) carry m_primes + per-image
-    arrays; aggregate (B) carries m_prime + sim + quality."""
+    arrays; aggregate (B) carries m_prime + sim + quality; local_features
+    (E) carries inlier counts."""
     out: dict[str, Any] = {"S": round(d.get("S", 0.0), 4)}
     if channel_name == "color_hist":
         out.update({
@@ -52,6 +53,16 @@ def _round_channel_debug(channel_name: str, d: dict[str, Any]) -> dict[str, Any]
             "baseline": round(d.get("baseline", 0.0), 4),
             "have_stash": d.get("have_stash"),
             "have_extractor": d.get("have_extractor"),
+        })
+    elif channel_name == "local_features":
+        out.update({
+            "max_inliers": d.get("max_inliers", 0),
+            "min_inliers": d.get("min_inliers"),
+            "target_inliers": d.get("target_inliers"),
+            "n_extractor_images": d.get("n_extractor_images", 0),
+            "n_stash_hashes": d.get("n_stash_hashes", 0),
+            "extractor_refs": d.get("extractor_refs", []),
+            "n_inliers_per_pair": d.get("n_inliers_per_pair", []),
         })
     else:
         out.update({
@@ -132,9 +143,10 @@ async def search(
                 }
                 for c in ranked[:K]
             }
+            rerank_label = "A/B/C/E" if (image_channels and "local_features" in image_channels) else "A/B/C"
             logger.info(
-                "search: image two-pass D-batch n=%d → A/B/C re-rank top_k=%d",
-                n_cand, len(top_k_keys),
+                "search: image two-pass D-batch n=%d → %s re-rank top_k=%d",
+                n_cand, rerank_label, len(top_k_keys),
             )
         else:
             logger.info(

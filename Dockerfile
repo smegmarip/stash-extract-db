@@ -35,7 +35,8 @@ RUN pip install --no-cache-dir \
     "numpy<2" \
     "guessit>=3.8" \
     "dateparser>=1.2" \
-    "transformers>=4.40,<5"
+    "transformers>=4.40,<5" \
+    "kornia>=0.7.3"
 
 COPY bridge /app/bridge
 

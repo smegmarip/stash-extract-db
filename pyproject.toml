@@ -24,6 +24,13 @@ embedding = [
     "torch>=2.2",
     "transformers>=4.40",
 ]
+local_features = [
+    # Channel E (local-feature matching: SuperPoint + LightGlue + RANSAC).
+    # Reuses the torch installed by the embedding extra; kornia ships
+    # pretrained SuperPoint/LightGlue weights and a RANSAC implementation.
+    "torch>=2.2",
+    "kornia>=0.7.3",
+]
 test = [
     "pytest>=8.0",
     "pytest-asyncio>=0.24",

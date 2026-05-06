@@ -157,6 +157,15 @@ async def _featurize_inner(job_id: str) -> None:
                     except Exception as e:
                         logger.warning("featurize: embedding compute failed job=%s ref=%s :: %s",
                                        job_id, synth_ref, e)
+                if settings.bridge_local_features_enabled:
+                    try:
+                        from .image_match import extractor_image_keypoints
+                        await extractor_image_keypoints(
+                            job_id, synth_ref, prefetched_bytes=frame_bytes,
+                        )
+                    except Exception as e:
+                        logger.warning("featurize: keypoints compute failed job=%s ref=%s :: %s",
+                                       job_id, synth_ref, e)
                 if h is not None:
                     ref_hash_a[synth_ref] = h
                 if bc.get("color_hist") is not None:
