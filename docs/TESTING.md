@@ -29,6 +29,10 @@ tests/
 │   │                                 # (CLAUDE.md §13.7/§13.8/§13.8.1)
 │   ├── test_imgmatch_animated.py     # synthetic ref expansion, _parent_ref, _resolve_fingerprint_for,
 │   │                                 # _collapsed_stash_cover_fetcher, prefetched-bytes featurize path
+│   ├── test_local_features.py        # channel E (SuperPoint+LightGlue): algorithm-key versioning,
+│   │                                 # blob serialization round-trip, GPU-skipped encode/match smoke
+│   ├── test_image_match_channel_e.py # score_image_channel_e shape: empty-side returns 0, below
+│   │                                 # min_inliers no-fire, max-across-pairs, composite math with E
 │   ├── test_performer_index.py       # performer_index schema, populate hook, FK cascade, dedup,
 │   │                                 # null/non-string handling, idempotent backfill (CLAUDE.md §17)
 │   └── test_admin_endpoints.py       # /api/admin/* projections: jobs (incl. full feature_state),
@@ -302,6 +306,7 @@ Before tuning anything for a new corpus, run a 10–30 scene sample with `?debug
 | Code change in `embedding.py`            | `pytest tests/unit/test_embedding.py` (GPU-only encode tests auto-skip on CPU) |
 | Code change in D-batch / prefilter wiring | `pytest tests/unit/test_image_match_prefilter.py` |
 | Code change in performer_index populate / backfill | `pytest tests/unit/test_performer_index.py` |
+| Code change in `local_features.py` or channel E scoring | `pytest tests/unit/test_local_features.py tests/unit/test_image_match_channel_e.py` (GPU-only encode/match tests auto-skip on CPU) |
 | Code change in `bridge/app/api/admin.py` or viewer-facing projections | `pytest tests/unit/test_admin_endpoints.py` |
 | Any code change                          | `pytest tests/unit/` (full suite)                |
 | Changing scoring defaults                | Re-run a calibration sweep, append to `CALIBRATION_RESULTS.md` (CLAUDE.md §13.11 don't) |

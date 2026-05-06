@@ -367,6 +367,37 @@ For the legacy A/B/C-only path (no embedding in channels), K is ignored and sing
 - **Don't** apply A/B/C-style sharpening or count-saturation to channel D. Cosine similarity is already in [-1, 1] and corpus-independent — sharpening it against a per-job baseline reintroduces the calibration problem D was created to avoid.
 - **Don't** put A/B/C-style `c_i` weights on D embeddings. Repeated images in a record contribute their own embedding similarity each time; the average gives them appropriate weight. Adding c_i correction would double-count the dedup-safety the embedding space already provides.
 
+### 13.E Channel E: local-feature matching (SuperPoint + LightGlue)
+
+> **Where channel D compresses an image to a single global vector, channel E preserves local correspondences. SuperPoint detects keypoints + descriptors; LightGlue matches them across two images; RANSAC homography reports the inlier count. The inlier count is what survives viewpoint shift, so E targets the failure class where D's holistic representation drops below threshold on same-scene-different-angle pairs.**
+
+**Why E exists alongside D**: D's CLS-token cosine similarity drops sharply when extractor-side and Stash-side images of the same content differ in camera angle, lens, or resolution — even though all the structural cues (faces, costume patterns, set decor) are still present in both frames. Local features survive that gap because they're anchored to specific corners and textures rather than holistic composition. E is the "is this geometrically the same scene" verifier that complements D's "is this conceptually similar content" recall.
+
+**Compute path**:
+1. **Featurize**: per-image keypoints + descriptors via SuperPoint (default 512 keypoints, 256-d descriptors fp16). Stored in `image_features` with `channel='keypoints'` and `algorithm='superpoint:N=<max_kp>:fp16'`. Per-image storage ~260 KB at 512 keypoints.
+2. **Match-time** (top-K only — see activation): for each (record_image, stash_frame) pair, LightGlue produces matches; kornia RANSAC fits a homography and reports inlier count.
+3. **Compose**: `S_E = clip(max_pair_inliers / target_inliers, 0, 1)` if `max_pair_inliers ≥ min_inliers`, else 0. Joins the existing `compose()` math as a fired channel — `composite = max(fired) + bonus * (n_fired - 1)`.
+
+**Activation**: gated by `BRIDGE_LOCAL_FEATURES_ENABLED=true` AND `local_features` in `BRIDGE_IMAGE_CHANNELS`. **E only fires inside the K>0 two-pass** — when K=0 (embedding-only), `score_image_composite` is never called, so E is silently absent regardless of channel-list config. This is a feature: K=0 is the "fast path, D-only" mode and E's per-pair LightGlue cost belongs nowhere near it.
+
+**The math is corpus-independent and self-normalizing — no calibration**:
+- Inlier counts are physically interpretable: a homography fitting 50 keypoint correspondences across two images means those 50 points really do come from the same physical surface. There's no per-corpus noise floor to subtract, no `c_i` correction needed (each pair is its own evidence).
+- This is the same property that motivated D over A/B/C: skip the per-corpus normalization, get a signal that transfers across content shapes. E inherits it.
+
+**Field hypothesis (untested at time of writing)**: E should fire on the rank-1-correct-but-below-threshold cases that motivated it. Patterned costumes, persistent set decor, and shared faces produce 30–200 inliers between within-scene sprite frames and within-scene record stills — well above the `min_inliers=15` gate, well below the `target_inliers=50` saturation point. Cosine similarity in D drops to 0.45–0.65 on those cases; E lifts the composite via the additive bonus when both fire. Validation gate is the corresponding run section in `docs/calibration/CALIBRATION_RESULTS.md` once the smoke test lands.
+
+**Latency**: a single `match_pair` is ~30–50 ms on GPU. At K=10, N=5 record images, M=8 sprite frames the worst case is K × N × M × 40 ms ≈ 16 s. The two-pass pre-filter bounds this; the sprite-pruning optimization (one pair per record_image, picked by D's `per_image_max`) drops it to ~K × N × 40 ms ≈ 2 s and is ready to pull if validation lifts precision but latency hurts. Phase 5 follow-up, not Phase 1–4.
+
+**Storage**: ~260 KB/image at the default 512 max_keypoints. Halves to ~130 KB at 256 keypoints with negligible quality loss for matching. Cascade invalidation reuses the existing `extractor_image` source taxonomy — no schema change, no new cascade query.
+
+**Don'ts**:
+- **Don't** apply sharpening, count-saturation, distribution-shape, or `c_i` to E. Inlier counts are corpus-independent; the calibration mechanism A/B/C need would re-introduce the per-corpus dependency E was created to avoid (same logic as §13.10's argument for D).
+- **Don't** run E outside the K>0 two-pass. K=0 is the embedding-only fast path; adding LightGlue + RANSAC there defeats its purpose. The activation gate enforces this implicitly via `score_image_composite` not being called in K=0 mode.
+- **Don't** decode asset bytes at match time. Featurization is the single writer of `image_features` rows under `channel='keypoints'` (same contract as §13.10 for embeddings). Match-time deserializes blobs and never touches PIL.
+- **Don't** invoke `match_pair_async` from a coroutine without `asyncio.to_thread` (the helper handles this internally via `match_pair_sync`). Same §14.4 rule that protects D.
+- **Don't** lower `min_inliers` below ~10 to make E "fire more often". Unrelated images regularly produce 5–10 spurious matches under RANSAC; below 15 the false-fire rate corrupts D's correct rankings via the bonus.
+- **Don't** add Stash-side LRU eviction for keypoints rows in this phase. Same `last_accessed_at`-driven path as embeddings (§14.9); no new logic needed.
+
 ---
 
 ## 14. Featurization lifecycle is eager-at-startup; the hot path is `ready` → 200, else → 503
@@ -555,6 +586,8 @@ Extractor-side rows are never evicted — they're bounded by job count and clear
 | `extractor_image`      | `<job_id>:<image_ref>` for static, `<job_id>:<image_ref>#frame_<N>` for animated frames (§13.8.1) | Cleared by `completed_at` cascade (§14.5) |
 | `extractor_aggregate`  | `<job_id>:<record_idx>` (channel B aggregate)   | Cleared by `completed_at` cascade (§14.5) |
 
+The same `source` rows host multiple `channel` values: `phash`, `color_hist`, `tone`, `embedding`, and (when §13.E is enabled) `keypoints`. Cascade invalidation is by `(source, ref_id)` regardless of channel — a job's keypoints rows clear on `completed_at` advance the same way its pHash rows do.
+
 **Don't** introduce a sixth `source` value without updating the cascade query in §14.5 and the eviction predicate in §14.9.
 
 ### 15.3 Phase 7 dual-write retirement
@@ -583,6 +616,7 @@ While `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=true` (default): every pHash compute wri
 | Storage growing without bound                 | §14.9 — LRU eviction loop disabled (`BRIDGE_STASH_FEATURE_BUDGET_BYTES=0`?) or interval too long. Stash-side rows are the unbounded class; extractor-side rows are job-cascade-bound.                                                                                                          |
 | Animated cover / record asset never matches   | §13.8.1 — (a) HEIF/AVIF assets are hard-skipped per §13.8 rule 4; nothing to debug. (b) Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref — if absent, featurization saw the bytes as static (`is_animated_bytes` returned False) or PIL decode failed; treat as decode failure. (c) Average `count(synth_rows) / count(distinct_assets)` should be close to `BRIDGE_ANIMATED_FRAMES_MAX` for a corpus with mostly long animations; values much lower indicate truncated GIFs (rare) or featurization rerun with a stale code version (cache invalidation).                                          |
 | Performer missing from viewer Performers list | §17 — `performer_index` not populated for that job. Check `SELECT COUNT(*) FROM performer_index WHERE job_id='<job>'`. If empty, the populate hook in `upsert_job_and_results` either didn't run (job predates the schema migration) or the startup `backfill_performer_index()` task failed. Logs at startup show progress; re-run by deleting the row(s) and restarting the bridge. |
+| Channel E never fires on a known same-scene/different-angle pair | §13.E — (a) verify `BRIDGE_LOCAL_FEATURES_ENABLED=true` AND `local_features` is in `BRIDGE_IMAGE_CHANNELS`. (b) Confirm `BRIDGE_EMBEDDING_PREFILTER_K > 0` — E does not run in K=0 mode by design. (c) `SELECT COUNT(*) FROM image_features WHERE channel='keypoints' AND ref_id LIKE '<job_id>:%'` — empty means featurization didn't precompute (kornia missing or `BRIDGE_LOCAL_FEATURES_ENABLED` was off at featurize time). (d) `?debug=1` and inspect `_debug.image.channels.local_features.{max_inliers, n_inliers_per_pair}`. `max_inliers < 15` means the homography genuinely doesn't fit — that's the corpus telling you the pair isn't actually same-scene-different-angle. |
 
 ---
 

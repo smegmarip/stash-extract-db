@@ -369,6 +369,7 @@ For deeper architectural questions, [`CLAUDE.md`](../CLAUDE.md) §16 has the sym
 | Animated cover/asset never matches                           | Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref. If absent, featurization saw the bytes as static or PIL decode failed; treat as decode failure. HEIF/AVIF are hard-skipped by design (CLAUDE.md §13.8.1).   |
 | Viewer Performers list missing a name you expect             | CLAUDE.md §17 / §16 — `performer_index` empty for that job. Check `SELECT COUNT(*) FROM performer_index WHERE job_id='<job>'`. If 0, restart the bridge to re-run `backfill_performer_index()` (logs progress at startup). The viewer itself is a passive renderer; data gaps are always upstream. |
 | Viewer Query page returns ERR_EMPTY_RESPONSE                 | Regression of the `viewer/server/index.ts` no-body-parser rule (CLAUDE.md §17.4). `express.json()` consumes the POST stream before http-proxy-middleware can forward it; the bridge sees an empty request and the proxy hangs.                       |
+| Channel E never fires                                        | §11.3. Common causes: (a) `BRIDGE_LOCAL_FEATURES_ENABLED=false`; (b) `local_features` not in `BRIDGE_IMAGE_CHANNELS`; (c) `BRIDGE_EMBEDDING_PREFILTER_K=0` (E doesn't run in K=0 mode by design); (d) keypoints rows missing because featurization predates flag flip — delete `image_features` for the affected job and restart to re-featurize. |
 
 ---
 
@@ -432,6 +433,13 @@ These are the bridge's calibrated behavior, sourced from a 491-video Pexels corp
 | `BRIDGE_EMBEDDING_BATCH_SIZE`                 | `16`                        | Featurize-time forward-pass batch. Per-request scoring uses sprite-batch sizes naturally.                                                                                               |
 | `BRIDGE_EMBEDDING_THRESHOLD`                  | `0.7`                       | Cosine-similarity gate for scrape mode (when channel D fires alone). Cross-corpus stable.                                                                                               |
 | `BRIDGE_EMBEDDING_PREFILTER_K`                | `10`                        | `K>0`: two-pass — D ranks all candidates in one matmul, A/B/C re-score top-K. `K=0`: embedding-only — A/B/C compute skipped entirely (fastest). See §10.5.                              |
+| `BRIDGE_LOCAL_FEATURES_ENABLED`               | `false`                     | Channel E (SuperPoint + LightGlue local-feature matching). Disabled by default; flip to `true` and add `local_features` to `BRIDGE_IMAGE_CHANNELS` to engage. See §11 + CLAUDE.md §13.E.|
+| `BRIDGE_LOCAL_FEATURE_MODEL`                  | `superpoint`                | Currently the only option. Reserved for future extractors (ALIKED, DISK).                                                                                                              |
+| `BRIDGE_LOCAL_FEATURE_DEVICE`                 | `auto`                      | `auto` / `cuda` / `cpu`. Mirrors `BRIDGE_EMBEDDING_DEVICE`.                                                                                                                              |
+| `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS`          | `512`                       | SuperPoint paper default. Storage scales linearly: ~260 KB/image at 512, ~130 KB at 256.                                                                                                |
+| `BRIDGE_LOCAL_FEATURE_MIN_INLIERS`            | `15`                        | RANSAC inlier count below which Channel E does not fire (S=0). Tuned for SuperPoint+LightGlue+RANSAC self-match floor; lower values produce false fires on unrelated images.            |
+| `BRIDGE_LOCAL_FEATURE_TARGET_INLIERS`         | `50`                        | Inlier count where S_E saturates at 1.0. Computed as `clip(max_inliers / target_inliers, 0, 1)` once min_inliers is met.                                                                |
+| `BRIDGE_LOCAL_FEATURE_RANSAC_THRESH`          | `5.0`                       | RANSAC reprojection threshold (pixels). Tighter values reject more candidate inliers; looser values accept more spurious ones.                                                          |
 | `DOCKER_RUNTIME` _(compose)_                  | `nvidia`                    | GPU passthrough. Override to `runc` on dev hosts without a CUDA GPU; the bridge falls back to CPU embedding (~10× slower, still functional).                                            |
 
 ### 9.3 Why "calibrated" is still in env, not Python code
@@ -519,3 +527,65 @@ Inspect log lines to confirm which path is engaged:
 - `scoring=multi+d_only` → K=0 embedding-only
 
 When `embedding` is not in `BRIDGE_IMAGE_CHANNELS`, K is ignored and the legacy single-pass A/B/C path runs across every candidate. That path scales with corpus size (each candidate gets per-image hash compute) and is only viable when total cost stays under your scrape timeout budget.
+
+---
+
+## 11. Channel E: local-feature matching (SuperPoint + LightGlue)
+
+For corpora where channel D ranks the right candidate at top-1 but the global-embedding cosine sits below threshold — same scene, different camera angle / lens / resolution — local-feature matching adds geometric corroboration that survives viewpoint shift. Channel E uses SuperPoint (kornia) for keypoint extraction, LightGlue for matching, and RANSAC homography to count inliers.
+
+See [`CLAUDE.md`](../CLAUDE.md) §13.E for the architectural invariants and [`docs/CHANNEL_E_PLAN.md`](CHANNEL_E_PLAN.md) for the implementation/validation plan.
+
+### 11.1 Activation
+
+```bash
+# In .env:
+DOCKER_RUNTIME=nvidia                              # or runc on CPU-only hosts
+BRIDGE_LOCAL_FEATURES_ENABLED=true
+BRIDGE_IMAGE_CHANNELS=phash,color_hist,tone,embedding,local_features
+# (or BRIDGE_IMAGE_CHANNELS=embedding,local_features for D + E only)
+
+# Then:
+docker compose build stash-extract-db                # picks up the kornia dep
+docker compose up -d --force-recreate stash-extract-db
+```
+
+First boot adds ~50 MB of SuperPoint + LightGlue weights to the existing `huggingface_cache` volume; subsequent recreates reuse it. Featurization for any non-`ready` job recomputes — adds ~25–50 s per ~500-record job on CUDA, several minutes on CPU. You'll see fresh 503s on `/match/*` until featurization completes (CLAUDE.md §14 contract).
+
+### 11.2 Gating: K must be > 0
+
+Channel E only fires inside the K>0 two-pass. When `BRIDGE_EMBEDDING_PREFILTER_K=0`, `score_image_composite` is never called and E is silently absent regardless of the channel-list config. This is intentional — K=0 is the embedding-only fast path and per-pair LightGlue cost has no place there. If you need E and were running K=0, raise to K=10 (or higher).
+
+### 11.3 Verifying the channel is firing
+
+```bash
+curl -s -X POST 'http://localhost:13000/match/fragment?debug=1' \
+  -H 'Content-Type: application/json' \
+  -d '{"scene_id":"<id>","mode":"search","image_channels":["embedding","local_features"]}' \
+  | jq '.[0]._debug.image.channels.local_features'
+```
+
+Expected fields: `S` (0 or in `[min_inliers/target_inliers, 1]`), `max_inliers`, `n_inliers_per_pair` (a 2D array of inlier counts per record_image × stash_frame), `n_extractor_images`, `n_stash_hashes`, `extractor_refs`. If `n_inliers_per_pair` is empty, no keypoints rows are cached for the candidate's images — featurization didn't run. Check `BRIDGE_LOCAL_FEATURES_ENABLED` was on when featurization happened (cascade-invalidate by deleting `image_features` rows for the affected job and restarting if not).
+
+### 11.4 Latency expectations
+
+A single `match_pair` is ~30–50 ms on a recent CUDA GPU. At default K=10, N=5 record images, M=8 sprite frames the worst case is K × N × M × 40 ms ≈ 16 s per request — bounded by the existing two-pass prefilter so it never scales with corpus size. CPU-only hosts run roughly 5–10× slower; the request will exceed Stash's default 90 s scraper timeout if combined corpus + N + M is large.
+
+If precision lifts but latency hurts, the sprite-pruning optimization (one pair per record_image, picked by D's `per_image_max`) drops worst-case to ~K × N × 40 ms ≈ 2 s. Not in the minimum-shippable; tracked in `CHANNEL_E_PLAN.md` Phase 5.
+
+### 11.5 CPU fallback
+
+`BRIDGE_LOCAL_FEATURE_DEVICE=cpu` works — kornia's SuperPoint and LightGlue have CPU paths, just slower. Featurization moves from ~25 s to several minutes per ~500-record job; per-request E adds ~150–500 ms per pair instead of ~50 ms. For dev/eval where the GPU isn't allocated to the bridge.
+
+### 11.6 Storage and rollback
+
+Storage at default 512 max_keypoints: ~260 KB/image. Halve to ~130 KB by setting `BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS=256` — slight quality loss for matching, acceptable for most corpora. Cascade invalidation reuses the existing `extractor_image` source (CLAUDE.md §15.2), so per-job clear works without code change.
+
+Rollback: flip `BRIDGE_LOCAL_FEATURES_ENABLED=false`. Existing `keypoints` rows survive but are inert (no scoring path reaches them) until cascade-invalidated. To reclaim storage immediately:
+
+```sql
+-- Delete only Channel E rows; leaves D / A / B / C alone.
+DELETE FROM image_features WHERE channel = 'keypoints';
+```
+
+(Run inside the bridge's SQLite via `docker exec stash-extract-db sqlite3 /data/stash-extract-db.db`. Won't affect the legacy `image_hashes` table.)

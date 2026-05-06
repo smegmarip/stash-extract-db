@@ -60,6 +60,20 @@ services:
       BRIDGE_EMBEDDING_BATCH_SIZE: "${BRIDGE_EMBEDDING_BATCH_SIZE:-16}"
       BRIDGE_EMBEDDING_THRESHOLD: "${BRIDGE_EMBEDDING_THRESHOLD:-0.7}"
       BRIDGE_EMBEDDING_PREFILTER_K: "${BRIDGE_EMBEDDING_PREFILTER_K:-10}"
+
+      # Channel E: local-feature matching (SuperPoint + LightGlue).
+      # Disabled by default; flip ENABLED=true and add `local_features`
+      # to BRIDGE_IMAGE_CHANNELS to engage. Targets the failure class
+      # where D ranks the right candidate at top-1 but cosine sits
+      # below threshold (same scene, different camera angle / lens /
+      # resolution). See CLAUDE.md §13.E and docs/CHANNEL_E_PLAN.md.
+      BRIDGE_LOCAL_FEATURES_ENABLED: "${BRIDGE_LOCAL_FEATURES_ENABLED:-false}"
+      BRIDGE_LOCAL_FEATURE_MODEL: "${BRIDGE_LOCAL_FEATURE_MODEL:-superpoint}"
+      BRIDGE_LOCAL_FEATURE_DEVICE: "${BRIDGE_LOCAL_FEATURE_DEVICE:-auto}"
+      BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS: "${BRIDGE_LOCAL_FEATURE_MAX_KEYPOINTS:-512}"
+      BRIDGE_LOCAL_FEATURE_MIN_INLIERS: "${BRIDGE_LOCAL_FEATURE_MIN_INLIERS:-15}"
+      BRIDGE_LOCAL_FEATURE_TARGET_INLIERS: "${BRIDGE_LOCAL_FEATURE_TARGET_INLIERS:-50}"
+      BRIDGE_LOCAL_FEATURE_RANSAC_THRESH: "${BRIDGE_LOCAL_FEATURE_RANSAC_THRESH:-5.0}"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
