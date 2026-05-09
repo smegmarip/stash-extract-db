@@ -363,7 +363,7 @@ function NumberField({
 function ChannelMultiselect({
   value, onChange,
 }: { value: ImageChannel[] | null | undefined; onChange: (v: ImageChannel[] | null) => void }) {
-  const all: ImageChannel[] = ["phash", "color_hist", "tone", "embedding"];
+  const all: ImageChannel[] = ["phash", "color_hist", "tone", "embedding", "local_features"];
   const set = new Set(value || []);
   const toggle = (ch: ImageChannel) => {
     if (set.has(ch)) set.delete(ch);

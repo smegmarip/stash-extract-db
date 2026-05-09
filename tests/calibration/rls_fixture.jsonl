@@ -1,0 +1,41 @@
+# RLS (Stash studio 426) verified-correct fixture for Phase 4a.
+# Identifier: record_id (= record_uuid, surfaced in /match/* responses).
+#
+# Curation rule (must hold for every entry):
+#   1. Stash scene has a definitively-correct extractor record (= expected_record_id),
+#      identified either by the viewer Query page returning it OR by human eye
+#      browsing the viewer Records page.
+#   2. The record carries >=1 usable image (cover_image or images[]). Animated
+#      assets count — featurization expands them into per-frame refs.
+#   3. The image(s) plausibly depict the same content/people/setting as the
+#      Stash scene's screenshot. Subtle overlap (same room, same performer
+#      different pose) is in scope — that's exactly the [0.40, 0.69] band E
+#      targets. Text-only matches (title/date/performer alone, no visual
+#      overlap) are NOT eligible — an image-channel gate cannot measure E
+#      on those.
+#
+# Provenance: 10 entries verified via the viewer Query page (top-1 currently
+# correct under the deployed bridge); 11 additional entries verified by
+# human-eye browsing of extractor records (top-1 may currently be wrong —
+# these are the cases Phase 4a's [0.40, 0.69]-band gate is built to test).
+{"scene_id": "15160", "expected_record_id": "9a6dd3572e33b883"}
+{"scene_id": "15174", "expected_record_id": "9adf7fa1a291f93d"}
+{"scene_id": "15173", "expected_record_id": "d58e48fc3498ace2"}
+{"scene_id": "15179", "expected_record_id": "7770af274c294b0f"}
+{"scene_id": "15195", "expected_record_id": "29bea24767c14d01"}
+{"scene_id": "15194", "expected_record_id": "80f7f3816d512eaa"}
+{"scene_id": "15198", "expected_record_id": "de797d9bf1835271"}
+{"scene_id": "15196", "expected_record_id": "4b3558b42aacb1f4"}
+{"scene_id": "15206", "expected_record_id": "39a31e94b4f1e948"}
+{"scene_id": "15207", "expected_record_id": "08488b0c25290811"}
+{"scene_id": "15158", "expected_record_id": "5e4f20fa64518864"}
+{"scene_id": "15175", "expected_record_id": "2367f99a870bdd9a"}
+{"scene_id": "15177", "expected_record_id": "e35d1ced736a1c48"}
+{"scene_id": "15190", "expected_record_id": "a5e96ba1b073c521"}
+{"scene_id": "15197", "expected_record_id": "9da1b1c9c54a7c6e"}
+{"scene_id": "15199", "expected_record_id": "653141e47b113462"}
+{"scene_id": "15204", "expected_record_id": "6ba3d7506516f6ef"}
+{"scene_id": "15201", "expected_record_id": "98036ebb20b5f33d"}
+{"scene_id": "15200", "expected_record_id": "82a4dbaf616db12e"}
+{"scene_id": "15203", "expected_record_id": "b4f51d668d37d27a"}
+{"scene_id": "15217", "expected_record_id": "e6fc1ef9632efcb9"}

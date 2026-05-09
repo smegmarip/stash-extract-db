@@ -90,7 +90,7 @@ export interface PerJobFeatureStatus {
 export type MatchMode = "scrape" | "search";
 export type ImageMode = "cover" | "sprite" | "both";
 export type HashAlgorithm = "phash" | "dhash" | "ahash" | "whash";
-export type ImageChannel = "phash" | "color_hist" | "tone" | "embedding";
+export type ImageChannel = "phash" | "color_hist" | "tone" | "embedding" | "local_features";
 
 export interface MatchParams {
   mode: MatchMode;
