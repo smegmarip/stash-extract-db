@@ -354,6 +354,34 @@ For the legacy A/B/C-only path (no embedding in channels), K is ignored and sing
 
 **Don't** route A/B/C scoring around D's prefilter when K > 0 and D is in channels. The whole correctness argument depends on A/B/C only seeing the top-K. Promoting an A/B/C-favored candidate D never ranked is the bug the two-pass design specifically prevents.
 
+### 13.E Channel E (DISK + LightGlue local-feature matching) — explored, abandoned
+
+A `feat/channel-e` branch implemented per-keypoint local-feature matching as a 5th channel, intended to lift borderline cases where D's holistic embedding underperforms — specifically the "same scene, different camera angle" failure mode where global similarity drops but structural correspondence persists. The implementation behaved correctly: keypoints + LightGlue + RANSAC homography all worked, and isolated smoke tests showed E firing on borderline cases as designed (e.g. composite 0.72 → 1.0 with 58 inliers on one canonical case).
+
+Phase 4a validation against a 21-entry RLS fixture (Stash studio 426; 10 query-verified + 11 visual-verified scenes) failed the borderline-band lift gate:
+
+| Gate                                                | Threshold        | Result        |
+| --------------------------------------------------- | ---------------- | ------------- |
+| Δ p@1 ≥ baseline                                    | ≥ 0              | 0.476 → 0.476 (pass) |
+| [0.40, 0.69] composite-band lift in ≥half of cases  | ≥ +0.1 in ≥2/4   | 1/4 (fail)    |
+| [0.70, 1.0] rank stability                          | rank=1 holds     | 9/9 (pass)    |
+
+Two distinct structural causes surfaced under the harness:
+
+1. **Signal misalignment on same-set corpora**: E correctly identifies geometric correspondence; on a same-studio corpus, that correspondence preferentially tracks "same studio set" (wrong correlations) rather than "same scene" (right correlations). E fires strongly on competing wrong candidates that share the studio's room/lighting/camera framing. The smoke validation missed this because it only tested whether E *fires* on the correct candidate; it didn't test whether E *fails to fire* on competing wrong candidates — the actual selectivity question.
+
+2. **Signal-packaging failure on composite assets**: when an extractor record's images are inlay collages (multiple scaled-down scene frames laid out within one asset), DISK keypoints land mostly on layout borders and at-scale features that don't correspond to the scene's full-resolution sprite frames. The signal IS in the asset (the inlays are real scene captures) but in a form E can't consume. Cf. animated assets in §13.8.1 which ARE decomposed into per-frame refs at featurization time; composite assets would need an analogous decomposition, not implemented.
+
+The deeper conclusion that drove the abandon decision: D and E are the same family — both perceptual matchers, just at different scales (CLS-token holistic for D, keypoint-geometric for E). Neither does symbolic reasoning about image content. The RLS failure mode requires semantic decomposition (named objects, performer attributes, props, setting) — a different signal class than either D or E provides. A "channel F" using vision-language captioning + sentence-embedding similarity was sketched and deferred; a smaller intermediate (swap D's encoder from DINOv2 to CLIP/SigLIP, which is language-aligned) was also considered. Neither was adopted in this iteration.
+
+The branch is preserved as a complete, documented attempt; not merged to main. Diagnostics, validation runs, and per-scene probes are in the branch's `SESSION_RESUME.md` and the harness JSONLs under `tests/calibration/runs/*e_rls_*`.
+
+**Don't** treat smoke success on isolated cases as evidence the algorithm works on a corpus — selectivity is the real test, and only a full-candidate harness run measures it.
+
+**Don't** retry channel E on a different corpus without first confirming (a) the corpus has visual variation between candidates (E discriminates via geometric correspondence, which fails on uniform-set content), and (b) the extractor records contain in-scene captures that share visual structure with the scenes' video frames (composite/promo/inlay assets defeat E regardless of corpus shape).
+
+**Don't** add a 5th channel to the composite math under the same `max + bonus * (n_fired - 1)` rule without first verifying that the new channel's selectivity matches A/B/C/D's. A channel that fires too readily on wrong candidates corrupts D's correct rankings via the bonus structure — the same failure mode warned about in §13.10's K-prefilter design, surfacing at a different layer.
+
 ### 13.11 Don'ts
 
 - **Don't** revert to single-channel scoring "because it's simpler" — single-channel was the bug.
@@ -528,7 +556,7 @@ Extractor-side rows are never evicted — they're bounded by job count and clear
 | Table                | PK shape                                | Role                                                                                                                                                                                                              |
 | -------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `extractor_jobs`     | `(job_id)`                              | Local mirror of extractor's `/api/jobs`. `completed_at` is the cascade trigger.                                                                                                                                  |
-| `extractor_results`  | `(job_id, result_index)`                | Local mirror of extractor's `/api/extraction/{job_id}/results`. Cascades from `extractor_jobs`.                                                                                                                  |
+| `extractor_results`  | `(job_id, result_index)`                | Local mirror of extractor's `/api/extraction/{job_id}/results`. Cascades from `extractor_jobs`. Carries `record_uuid TEXT NOT NULL` (UNIQUE) — a stable, content-derived identifier surfaced to the API as `record_id`. See §15.4.                |
 | `image_features`     | `(source, ref_id, channel, algorithm)`  | Per-(source, ref, channel) feature blob + `quality`. `last_accessed_at` populated only for Stash-side rows (used by §14.9 eviction).                                                                             |
 | `corpus_stats`       | `(job_id, channel, algorithm)`          | Per-job, per-channel `baseline` (empirical noise floor). Job-scoped because uniqueness is computed within one job's record set.                                                                                  |
 | `image_uniqueness`   | `(job_id, ref_id, channel)`             | Per-record-image `c_i`. Granularity is finer than `corpus_stats` (per-image, not per-job).                                                                                                                       |
@@ -560,6 +588,28 @@ Extractor-side rows are never evicted — they're bounded by job count and clear
 ### 15.3 Phase 7 dual-write retirement
 
 While `BRIDGE_LEGACY_DUAL_WRITE_ENABLED=true` (default): every pHash compute writes to both `image_hashes` (legacy) and `image_features` (new); reads check `image_features` first and fall back to `image_hashes`. Setting it `false` stops the dual-write and skips the legacy fallback. The actual `DROP TABLE image_hashes` is a manual op (see [`docs/HOW_TO_USE.md`](docs/HOW_TO_USE.md)). After dropping, you can't roll back to the legacy scoring path.
+
+### 15.4 `record_uuid` is the canonical record identity; `Code` is an optional scraped field
+
+> **`extractor_results.record_uuid` is the stable, globally-unique identifier for a record. The bridge surfaces it as `record_id` in `/match/*` responses. Test fixtures and external callers that need to identify a specific record key on it. `Code` (= `data.id`) is whatever scraped value the source page exposed — often null, never required to be unique.**
+
+The PK shape stays `(job_id, result_index)` — that's load-bearing for cascade purges, image_features `ref_id` format, and §10's deterministic tiebreak. `record_uuid` is an additional column with a UNIQUE index.
+
+**Compute** (`bridge/app/cache/db.py::compute_record_uuid`): `sha256(job_id : page_url : result_index : canonical_json(data))[:16]`. Properties:
+
+- **Deterministic**: same content → same uuid. A cascade re-fetch (per §7) of unchanged data produces the same uuid.
+- **Job-scoped seed**: two jobs with byte-identical record content do not collide on the global UNIQUE index. Same content under a different `job_id` is semantically a different record (different cache instance, different ref_id namespace).
+- **Stable across cache invalidation**: when `completed_at` advances and rows are re-inserted (§14.5), uuids are recomputed identically — fixtures don't break on featurization re-runs.
+- **Independent of `data.id`**: the source's scraped id may be null, non-unique, or change across re-scrapes; the uuid is anchored on content + position, not on whatever the source happens to expose.
+
+**Surfaces**:
+- `/match/fragment`, `/match/url`, `/match/name` responses include `record_id` on every returned candidate (top-level field, alongside `match_score`).
+- `/api/admin/records*` projections include `record_id`.
+- The candidate dicts flowing through `bridge/app/matching/{scrape,search}.py` carry `record_uuid`.
+
+**Migration**: `_migrate_record_uuid` in `init_db()` backfills any pre-existing rows whose `record_uuid=''` (the schema default). Idempotent — runs cheaply on every startup.
+
+**Don't** match fixtures, debug envelopes, or external integrations against `Code`. Use `record_id`. The harness's `find_rank_of_expected` keeps a Code fallback for legacy `ground_truth.json`, but new fixtures should key on `record_id`. **Don't** include the result_index in user-facing identifiers — `record_uuid` is the canonical id; `result_index` is implementation. **Don't** populate `record_uuid` for Stash-side data; this column belongs to extractor records only (Stash records aren't in `extractor_results`).
 
 ---
 

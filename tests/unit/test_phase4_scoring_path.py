@@ -68,9 +68,11 @@ async def _seed_and_featurize(bridge_db, reset_worker, clean_settings, mock_clie
         (job_id, "TestSite", "sch1", "2026-04-29T00:00:00", "2026-04-29T00:00:00"),
     )
     for idx, r in enumerate(records):
+        uuid = bridge_db.compute_record_uuid(job_id, "", idx, r["data"])
         await bridge_db.db().execute(
-            "INSERT INTO extractor_results VALUES (?, ?, ?, ?)",
-            (job_id, idx, "", json.dumps(r["data"])),
+            "INSERT INTO extractor_results(job_id, result_index, page_url, data_json, record_uuid) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, idx, "", json.dumps(r["data"]), uuid),
         )
     await bridge_db.db().commit()
 
@@ -163,9 +165,11 @@ class TestLegacyFallback:
             ("j_legacy", "TestSite", "sch1", "2026-04-29", "2026-04-29"),
         )
         for idx, r in enumerate(records):
+            uuid = bridge_db.compute_record_uuid("j_legacy", "", idx, r["data"])
             await bridge_db.db().execute(
-                "INSERT INTO extractor_results VALUES (?, ?, ?, ?)",
-                ("j_legacy", idx, "", json.dumps(r["data"])),
+                "INSERT INTO extractor_results(job_id, result_index, page_url, data_json, record_uuid) "
+                "VALUES (?, ?, ?, ?, ?)",
+                ("j_legacy", idx, "", json.dumps(r["data"]), uuid),
             )
         await bridge_db.db().commit()
         set_scene(synth_image(42))

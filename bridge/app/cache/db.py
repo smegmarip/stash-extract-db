@@ -1,4 +1,6 @@
 """SQLite cache. Layout per requirements.md §8."""
+import hashlib
+import json
 import logging
 import os
 from typing import Any, Optional
@@ -26,9 +28,13 @@ CREATE TABLE IF NOT EXISTS extractor_results (
   result_index  INTEGER NOT NULL,
   page_url      TEXT,
   data_json     TEXT NOT NULL,
+  record_uuid   TEXT NOT NULL DEFAULT '',
   PRIMARY KEY (job_id, result_index),
   FOREIGN KEY (job_id) REFERENCES extractor_jobs(job_id) ON DELETE CASCADE
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_extractor_results_uuid
+  ON extractor_results(record_uuid)
+  WHERE record_uuid != '';
 
 CREATE INDEX IF NOT EXISTS idx_jobs_name_lower ON extractor_jobs(LOWER(job_name));
 
@@ -124,6 +130,54 @@ CREATE INDEX IF NOT EXISTS idx_performer_index_job ON performer_index(job_id);
 """
 
 
+def compute_record_uuid(
+    job_id: str, page_url: Optional[str], result_index: int, data: dict[str, Any],
+) -> str:
+    """Stable, content-derived record identifier.
+
+    Survives cache invalidation and re-fetch (cascade per §7) when job_id +
+    page_url + result_index + data are unchanged. Independent of `data.id`
+    (which is an optional scraped field, not a record identity). job_id is
+    in the seed so two jobs with identical record content don't collide on
+    the global UNIQUE index. 16 hex chars (= 64 bits) — well inside
+    collision tolerance.
+    """
+    canonical = json.dumps(data or {}, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    seed = f"{job_id}:{page_url or ''}:{result_index}:{canonical}"
+    return hashlib.sha256(seed.encode("utf-8")).hexdigest()[:16]
+
+
+async def _migrate_record_uuid(conn: aiosqlite.Connection) -> None:
+    """Backfill record_uuid for any existing rows that pre-date the column.
+
+    Idempotent: only touches rows with empty record_uuid. Safe to run on
+    every startup. Migration completes before the unique index is enforced
+    against populated rows (the partial index excludes empty values).
+    """
+    async with conn.execute(
+        "SELECT job_id, result_index, page_url, data_json "
+        "FROM extractor_results WHERE record_uuid = ''"
+    ) as cur:
+        rows = await cur.fetchall()
+    if not rows:
+        return
+    updates: list[tuple[str, str, int]] = []
+    for job_id, result_index, page_url, data_json in rows:
+        try:
+            data = json.loads(data_json)
+        except Exception:
+            data = {}
+        uuid = compute_record_uuid(str(job_id), page_url, int(result_index), data)
+        updates.append((uuid, str(job_id), int(result_index)))
+    await conn.executemany(
+        "UPDATE extractor_results SET record_uuid = ? "
+        "WHERE job_id = ? AND result_index = ?",
+        updates,
+    )
+    await conn.commit()
+    logger.info("record_uuid backfill: populated %d row(s)", len(updates))
+
+
 async def init_db() -> None:
     global _db
     os.makedirs(settings.data_dir, exist_ok=True)
@@ -132,6 +186,9 @@ async def init_db() -> None:
     await _db.execute("PRAGMA foreign_keys = ON")
     await _db.executescript(SCHEMA)
     await _db.commit()
+    # Existing-DB migration: pre-existing rows have record_uuid='' (from the
+    # NOT NULL DEFAULT). Compute and write the deterministic value.
+    await _migrate_record_uuid(_db)
     logger.info("SQLite cache ready at %s", db_path)
 
 
@@ -202,7 +259,6 @@ async def upsert_job_and_results(
     image_features rows survive — they're keyed by Stash content fingerprint,
     not by job, and remain valid across job changes.
     """
-    import json
     conn = db()
     await conn.execute("BEGIN")
     try:
@@ -217,10 +273,12 @@ async def upsert_job_and_results(
             page_url = r.get("page_url") or ""
             data = r.get("data") or {}
             data_json = json.dumps(data, ensure_ascii=False)
-            rows.append((job_id, idx, page_url, data_json))
+            record_uuid = compute_record_uuid(job_id, page_url, idx, data)
+            rows.append((job_id, idx, page_url, data_json, record_uuid))
             perf_rows.extend(_extract_performer_rows(job_id, idx, data))
         await conn.executemany(
-            "INSERT INTO extractor_results(job_id, result_index, page_url, data_json) VALUES (?, ?, ?, ?)",
+            "INSERT INTO extractor_results(job_id, result_index, page_url, data_json, record_uuid) "
+            "VALUES (?, ?, ?, ?, ?)",
             rows,
         )
         if perf_rows:
@@ -299,10 +357,10 @@ async def backfill_performer_index() -> int:
 
 
 async def list_results(job_id: str) -> list[dict[str, Any]]:
-    import json
     out: list[dict[str, Any]] = []
     async with db().execute(
-        "SELECT result_index, page_url, data_json FROM extractor_results WHERE job_id = ? ORDER BY result_index ASC",
+        "SELECT result_index, page_url, data_json, record_uuid "
+        "FROM extractor_results WHERE job_id = ? ORDER BY result_index ASC",
         (job_id,),
     ) as cur:
         async for row in cur:
@@ -310,7 +368,12 @@ async def list_results(job_id: str) -> list[dict[str, Any]]:
                 data = json.loads(row[2])
             except Exception:
                 data = {}
-            out.append({"result_index": row[0], "page_url": row[1], "data": data})
+            out.append({
+                "result_index": row[0],
+                "page_url": row[1],
+                "data": data,
+                "record_uuid": row[3],
+            })
     return out
 
 

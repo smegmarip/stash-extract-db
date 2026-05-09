@@ -71,6 +71,7 @@ def _project_record(
     result_index: int,
     page_url: Optional[str],
     data_json: str,
+    record_uuid: Optional[str] = None,
     feature_state: Optional[str] = None,
     feature_progress: Optional[float] = None,
 ) -> dict[str, Any]:
@@ -96,6 +97,7 @@ def _project_record(
         "job_id": job_id,
         "job_name": job_name,
         "result_index": result_index,
+        "record_id": record_uuid or None,
         "id": (data.get("id") or None),
         "title": data.get("title") or None,
         "details": data.get("details") or None,
@@ -219,7 +221,7 @@ async def list_records(
     order_by = _records_order_by(sort, dir)
     sql = (
         "SELECT er.job_id, j.job_name, er.result_index, er.page_url, er.data_json, "
-        "       f.state, f.progress "
+        "       er.record_uuid, f.state, f.progress "
         "FROM extractor_results er "
         "JOIN extractor_jobs j ON j.job_id = er.job_id "
         "LEFT JOIN job_feature_state f ON f.job_id = er.job_id "
@@ -231,8 +233,8 @@ async def list_records(
         async for row in cur:
             rows.append(_project_record(
                 job_id=row[0], job_name=row[1], result_index=int(row[2]),
-                page_url=row[3], data_json=row[4],
-                feature_state=row[5], feature_progress=row[6],
+                page_url=row[3], data_json=row[4], record_uuid=row[5],
+                feature_state=row[6], feature_progress=row[7],
             ))
 
     total_pages = (total + limit - 1) // limit if total else 0
@@ -251,7 +253,7 @@ async def list_records(
 async def get_record(job_id: str, result_index: int) -> dict[str, Any]:
     async with cdb.db().execute(
         "SELECT er.job_id, j.job_name, er.result_index, er.page_url, er.data_json, "
-        "       f.state, f.progress "
+        "       er.record_uuid, f.state, f.progress "
         "FROM extractor_results er "
         "JOIN extractor_jobs j ON j.job_id = er.job_id "
         "LEFT JOIN job_feature_state f ON f.job_id = er.job_id "
@@ -263,8 +265,8 @@ async def get_record(job_id: str, result_index: int) -> dict[str, Any]:
         raise HTTPException(status_code=404, detail="record not found")
     return _project_record(
         job_id=row[0], job_name=row[1], result_index=int(row[2]),
-        page_url=row[3], data_json=row[4],
-        feature_state=row[5], feature_progress=row[6],
+        page_url=row[3], data_json=row[4], record_uuid=row[5],
+        feature_state=row[6], feature_progress=row[7],
     )
 
 
@@ -351,7 +353,7 @@ async def get_performer(name: str) -> dict[str, Any]:
 
     sql = (
         "SELECT er.job_id, j.job_name, er.result_index, er.page_url, er.data_json, "
-        "       f.state, f.progress "
+        "       er.record_uuid, f.state, f.progress "
         "FROM performer_index pi "
         "JOIN extractor_results er ON er.job_id = pi.job_id AND er.result_index = pi.result_index "
         "JOIN extractor_jobs j ON j.job_id = er.job_id "
@@ -368,8 +370,8 @@ async def get_performer(name: str) -> dict[str, Any]:
             })
             entry["records"].append(_project_record(
                 job_id=row[0], job_name=row[1], result_index=int(row[2]),
-                page_url=row[3], data_json=row[4],
-                feature_state=row[5], feature_progress=row[6],
+                page_url=row[3], data_json=row[4], record_uuid=row[5],
+                feature_state=row[6], feature_progress=row[7],
             ))
 
     return {

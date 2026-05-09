@@ -115,6 +115,16 @@ export default function RecordDetailPage() {
                 <Row label="Index">
                   <span className="font-mono">{record.result_index}</span>
                 </Row>
+                {record.record_id ? (
+                  <Row label="Record ID">
+                    <span
+                      className="font-mono"
+                      title="Stable, content-derived identifier surfaced as record_id in /match/* responses (CLAUDE.md §15.4)"
+                    >
+                      {record.record_id}
+                    </span>
+                  </Row>
+                ) : null}
                 {record.id ? (
                   <Row label="Code">
                     <span className="font-mono">{record.id}</span>

@@ -18,6 +18,7 @@ interface CandidateLike {
   URL?: string | null;
   Details?: string | null;
   match_score?: number;
+  record_id?: string | null;
   _debug?: unknown;
 }
 
@@ -486,7 +487,7 @@ function CandidateTable({
             <th className="px-3 py-2 w-12">#</th>
             <th className="px-3 py-2 w-24">Image</th>
             <th className="px-3 py-2">Title</th>
-            <th className="px-3 py-2">Code</th>
+            <th className="px-3 py-2">ID</th>
             <th className="px-3 py-2">Studio</th>
             <th className="px-3 py-2">Performers</th>
             <th className="px-3 py-2 text-right">{isSearch ? "Score" : "Status"}</th>
@@ -534,7 +535,19 @@ function CandidateRow({
             </a>
           ) : null}
         </td>
-        <td className="px-3 py-2 font-mono text-xs">{c.Code || "-"}</td>
+        <td className="px-3 py-2 font-mono text-xs">
+          {c.record_id ? (
+            <div title="record_id (canonical, content-derived; CLAUDE.md §15.4)">
+              {c.record_id}
+            </div>
+          ) : null}
+          {c.Code ? (
+            <div className="opacity-70" title="Code (= scraped data.id; optional)">
+              Code: {c.Code}
+            </div>
+          ) : null}
+          {!c.record_id && !c.Code ? "-" : null}
+        </td>
         <td className="px-3 py-2 text-xs">{c.Studio?.Name || "-"}</td>
         <td className="px-3 py-2">
           <div className="flex flex-wrap gap-1">

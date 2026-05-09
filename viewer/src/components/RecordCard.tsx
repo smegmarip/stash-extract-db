@@ -61,6 +61,15 @@ export function RecordCard({ record, showJobBadge = true }: RecordCardProps) {
             </Badge>
           ) : null}
           {record.id ? <Badge variant="secondary">#{record.id}</Badge> : null}
+          {record.record_id ? (
+            <Badge
+              variant="outline"
+              title={`record_id: ${record.record_id}`}
+              className="font-mono text-[10px]"
+            >
+              {record.record_id}
+            </Badge>
+          ) : null}
         </div>
       </CardContent>
     </Card>

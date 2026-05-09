@@ -158,6 +158,7 @@ async def _build_candidate_pool(jobs: list[dict[str, Any]]) -> list[dict[str, An
                 "result_index": r["result_index"],
                 "page_url": r.get("page_url"),
                 "data": r["data"],
+                "record_uuid": r.get("record_uuid") or "",
             })
     return pool
 
@@ -290,7 +291,10 @@ async def match_by_url(req: UrlMatchRequest, debug: bool = Query(False)):
             alias_resolver = AliasResolver()
             if req.mode == "scrape":
                 out = await _record_to_scrape_result(hits[0], None, alias_resolver)
-                return out.model_dump(exclude_none=True)
+                d = out.model_dump(exclude_none=True)
+                if hits[0].get("record_uuid"):
+                    d["record_id"] = hits[0]["record_uuid"]
+                return d
             # search: prepend exact-URL hits with score=1.0; then continue.
             results = []
             limit = req.limit if req.limit is not None else settings.bridge_search_limit
@@ -298,6 +302,8 @@ async def match_by_url(req: UrlMatchRequest, debug: bool = Query(False)):
                 sr = await _record_to_scrape_result(h, None, alias_resolver)
                 d = sr.model_dump(exclude_none=True)
                 d["match_score"] = 1.0
+                if h.get("record_uuid"):
+                    d["record_id"] = h["record_uuid"]
                 results.append(d)
             return results
 
@@ -421,7 +427,10 @@ async def _match_with_scene(
             scene_id, winner["job_id"], winner["result_index"],
         )
         out = await _record_to_scrape_result(winner, studio_for_filter, alias_resolver)
-        return out.model_dump(exclude_none=True)
+        d = out.model_dump(exclude_none=True)
+        if winner.get("record_uuid"):
+            d["record_id"] = winner["record_uuid"]
+        return d
 
     # search
     ranked = await search_match(
@@ -445,6 +454,8 @@ async def _match_with_scene(
         sr = await _record_to_scrape_result(cand, studio_for_filter, alias_resolver)
         d = sr.model_dump(exclude_none=True)
         d["match_score"] = round(score, 4)
+        if cand.get("record_uuid"):
+            d["record_id"] = cand["record_uuid"]
         if dbg is not None:
             d["_debug"] = dbg
         out.append(d)

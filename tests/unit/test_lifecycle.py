@@ -51,9 +51,12 @@ async def _seed_job(bridge_db, job_id: str, records: list[dict], completed_at: s
         (job_id, "TestSite", "sch1", completed_at, completed_at),
     )
     for idx, r in enumerate(records):
+        page_url = r.get("page_url", "")
+        uuid = bridge_db.compute_record_uuid(job_id, page_url, idx, r["data"])
         await bridge_db.db().execute(
-            "INSERT INTO extractor_results VALUES (?, ?, ?, ?)",
-            (job_id, idx, r.get("page_url", ""), json.dumps(r["data"])),
+            "INSERT INTO extractor_results(job_id, result_index, page_url, data_json, record_uuid) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, idx, page_url, json.dumps(r["data"]), uuid),
         )
     await bridge_db.db().commit()
 

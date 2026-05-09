@@ -48,7 +48,8 @@ class PairResult:
     expected_record_id: Optional[str]
     expected_record_index: Optional[int]
     negative_control: bool
-    actual_record_id: Optional[str]    # top-1 from the bridge
+    actual_record_id: Optional[str]    # top-1 Code (= optional `data.id`)
+    actual_record_uuid: Optional[str]  # top-1 record_id (stable, content-derived)
     actual_score: Optional[float]
     actual_image_S: Optional[float]    # composite image S from debug
     rank_of_expected: Optional[int]    # 1-indexed position of expected in results, None if absent
@@ -74,10 +75,13 @@ class RunMetrics:
         positives = [p for p in pairs if not p.negative_control and p.expected_record_id]
         negatives = [p for p in pairs if p.negative_control]
 
-        n_correct = sum(1 for p in positives if p.actual_record_id == p.expected_record_id)
+        # Top-1 correctness flows through find_rank_of_expected (which prefers
+        # record_id and falls back to Code), so a fixture written against
+        # either identifier scores correctly without per-fixture flags.
+        n_correct = sum(1 for p in positives if p.rank_of_expected == 1)
         rrs = [(1.0 / p.rank_of_expected) if p.rank_of_expected else 0.0 for p in positives]
         scores = [p.actual_score for p in pairs if p.actual_score is not None]
-        n_neg_empty = sum(1 for p in negatives if not p.actual_record_id)
+        n_neg_empty = sum(1 for p in negatives if not p.actual_record_id and not p.actual_record_uuid)
 
         return cls(
             n_total=n_total,
@@ -159,8 +163,16 @@ def query_match(bridge_url: str, scene_id: str, params: dict, debug: bool = Fals
 
 
 def find_rank_of_expected(ranked: list[dict], expected_record_id: str) -> Optional[int]:
-    """1-indexed position of expected in ranked. None if absent."""
+    """1-indexed position of expected in ranked. None if absent.
+
+    Match by `record_id` (the bridge's stable, content-derived uuid surfaced
+    in /match/* responses) first; fall back to `Code` (= extractor `data.id`,
+    optional scraped identifier) for legacy fixtures (e.g. the Pexels
+    `ground_truth.json` predates the uuid).
+    """
     for i, r in enumerate(ranked or []):
+        if r.get("record_id") and r.get("record_id") == expected_record_id:
+            return i + 1
         if r.get("Code") == expected_record_id:
             return i + 1
     return None
@@ -199,7 +211,8 @@ def run_calibration(
                 expected_record_id=gt_entry.get("expected_record_id"),
                 expected_record_index=gt_entry.get("expected_record_index"),
                 negative_control=bool(gt_entry.get("negative_control")),
-                actual_record_id=None, actual_score=None, actual_image_S=None,
+                actual_record_id=None, actual_record_uuid=None,
+                actual_score=None, actual_image_S=None,
                 rank_of_expected=None, n_results=0,
                 error=str(ranked),
             ))
@@ -216,6 +229,7 @@ def run_calibration(
             expected_record_index=gt_entry.get("expected_record_index"),
             negative_control=bool(gt_entry.get("negative_control")),
             actual_record_id=(top or {}).get("Code"),
+            actual_record_uuid=(top or {}).get("record_id"),
             actual_score=(top or {}).get("match_score"),
             actual_image_S=actual_S,
             rank_of_expected=find_rank_of_expected(ranked, gt_entry.get("expected_record_id") or ""),
@@ -308,17 +322,22 @@ def test_calibration_run_against_live_bridge():
 def test_metrics_aggregation_logic():
     """Self-test: RunMetrics.from_pair_results computes p@1, MRR, mean
     score correctly across positives + negatives + errors."""
+    def _pair(scene_id, basename, expected, idx, neg, actual, score, S, rank, n,
+              actual_uuid=None):
+        return PairResult(
+            scene_id=scene_id, video_basename=basename,
+            expected_record_id=expected, expected_record_index=idx,
+            negative_control=neg,
+            actual_record_id=actual, actual_record_uuid=actual_uuid,
+            actual_score=score, actual_image_S=S,
+            rank_of_expected=rank, n_results=n,
+        )
     pairs = [
-        # Correct top-1
-        PairResult("1", "a.mp4", "scene_0", 0, False, "scene_0", 0.9, 0.9, 1, 5),
-        # Wrong top-1, expected at rank 2
-        PairResult("2", "b.mp4", "scene_1", 1, False, "scene_3", 0.5, 0.5, 2, 5),
-        # Wrong top-1, expected absent
-        PairResult("3", "c.mp4", "scene_2", 2, False, "scene_3", 0.4, 0.4, None, 5),
-        # Negative correctly returns nothing
-        PairResult("4", "d.mp4", None, None, True, None, None, None, None, 0),
-        # Negative wrongly returns something
-        PairResult("5", "e.mp4", None, None, True, "scene_4", 0.3, 0.3, None, 1),
+        _pair("1", "a.mp4", "scene_0", 0, False, "scene_0", 0.9, 0.9, 1, 5),
+        _pair("2", "b.mp4", "scene_1", 1, False, "scene_3", 0.5, 0.5, 2, 5),
+        _pair("3", "c.mp4", "scene_2", 2, False, "scene_3", 0.4, 0.4, None, 5),
+        _pair("4", "d.mp4", None, None, True, None, None, None, None, 0),
+        _pair("5", "e.mp4", None, None, True, "scene_4", 0.3, 0.3, None, 1),
     ]
     m = RunMetrics.from_pair_results(pairs)
     assert m.n_total == 5
@@ -337,6 +356,26 @@ def test_find_rank_of_expected():
     assert find_rank_of_expected(ranked, "c") == 3
     assert find_rank_of_expected(ranked, "z") is None
     assert find_rank_of_expected([], "a") is None
+
+
+def test_find_rank_of_expected_prefers_record_id():
+    """record_id (the bridge's stable uuid) takes precedence over Code."""
+    ranked = [
+        {"Code": "code_a", "record_id": "uuid_a"},
+        {"Code": "code_b", "record_id": "uuid_b"},
+    ]
+    # uuid match wins
+    assert find_rank_of_expected(ranked, "uuid_b") == 2
+    # Code fallback still works for legacy fixtures
+    assert find_rank_of_expected(ranked, "code_a") == 1
+    # record_id present but the search-key matches no row
+    assert find_rank_of_expected(ranked, "uuid_z") is None
+
+
+def test_find_rank_of_expected_legacy_fixture_no_record_id():
+    """Pexels-shape responses (record_id absent) fall back to Code."""
+    ranked = [{"Code": "scene_0000"}, {"Code": "scene_0001"}]
+    assert find_rank_of_expected(ranked, "scene_0001") == 2
 
 
 # --- CLI entry point (for ad-hoc runs outside pytest) --------------------

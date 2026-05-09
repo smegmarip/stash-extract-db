@@ -42,6 +42,95 @@ class TestSchema:
         assert "idx_jobs_name_lower" in idx
         assert "idx_features_ref" in idx
         assert "idx_features_lru" in idx
+        assert "idx_extractor_results_uuid" in idx
+
+
+# --- Record UUID --------------------------------------------------------
+
+class TestRecordUuid:
+    def test_compute_is_deterministic(self, bridge_db):
+        a = bridge_db.compute_record_uuid("jobA", "https://x.test/p", 0, {"title": "t"})
+        b = bridge_db.compute_record_uuid("jobA", "https://x.test/p", 0, {"title": "t"})
+        assert a == b
+
+    def test_compute_changes_on_data_change(self, bridge_db):
+        a = bridge_db.compute_record_uuid("jobA", "u", 0, {"title": "t"})
+        b = bridge_db.compute_record_uuid("jobA", "u", 0, {"title": "T"})
+        assert a != b
+
+    def test_compute_changes_on_job_change(self, bridge_db):
+        """Two jobs with identical record content must not collide on the
+        global UNIQUE index."""
+        a = bridge_db.compute_record_uuid("jobA", "u", 0, {"title": "t"})
+        b = bridge_db.compute_record_uuid("jobB", "u", 0, {"title": "t"})
+        assert a != b
+
+    def test_compute_independent_of_dict_order(self, bridge_db):
+        """Canonical JSON sort means insertion order doesn't change the uuid."""
+        a = bridge_db.compute_record_uuid("j", "u", 0, {"a": 1, "b": 2})
+        b = bridge_db.compute_record_uuid("j", "u", 0, {"b": 2, "a": 1})
+        assert a == b
+
+    def test_compute_returns_16_hex_chars(self, bridge_db):
+        u = bridge_db.compute_record_uuid("j", "u", 0, {"x": 1})
+        assert len(u) == 16
+        assert all(c in "0123456789abcdef" for c in u)
+
+    async def test_upsert_populates_uuid(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jU", job_name="U", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[
+                {"page_url": "https://a", "data": {"title": "a"}},
+                {"page_url": "https://b", "data": {"title": "b"}},
+            ],
+        )
+        async with bridge_db.db().execute(
+            "SELECT result_index, record_uuid FROM extractor_results "
+            "WHERE job_id='jU' ORDER BY result_index ASC"
+        ) as cur:
+            rows = await cur.fetchall()
+        assert len(rows) == 2
+        assert all(r[1] != "" for r in rows)
+        # Distinct uuids per record
+        assert rows[0][1] != rows[1][1]
+
+    async def test_list_results_returns_uuid(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jL", job_name="L", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[{"page_url": "https://x", "data": {"title": "x"}}],
+        )
+        results = await bridge_db.list_results("jL")
+        assert len(results) == 1
+        assert results[0]["record_uuid"] == bridge_db.compute_record_uuid(
+            "jL", "https://x", 0, {"title": "x"}
+        )
+
+    async def test_migration_backfills_legacy_rows(self, bridge_db):
+        """Rows written without a uuid (simulating pre-migration data) get
+        populated by _migrate_record_uuid on init_db."""
+        now = datetime.utcnow().isoformat()
+        await bridge_db.db().execute(
+            "INSERT INTO extractor_jobs VALUES (?, ?, ?, ?, ?)",
+            ("jOld", "Old", "s1", now, now),
+        )
+        # Insert with empty record_uuid (the column default)
+        await bridge_db.db().execute(
+            "INSERT INTO extractor_results(job_id, result_index, page_url, data_json) "
+            "VALUES (?, ?, ?, ?)",
+            ("jOld", 0, "https://o", '{"title":"o"}'),
+        )
+        await bridge_db.db().commit()
+        # Re-run the migration explicitly (init_db's tail step)
+        await bridge_db._migrate_record_uuid(bridge_db.db())
+        async with bridge_db.db().execute(
+            "SELECT record_uuid FROM extractor_results WHERE job_id='jOld'"
+        ) as cur:
+            row = await cur.fetchone()
+        assert row[0] == bridge_db.compute_record_uuid("jOld", "https://o", 0, {"title": "o"})
 
     async def test_init_idempotent(self, bridge_db, tmp_path):
         """Running init_db on an already-initialized DB doesn't fail or

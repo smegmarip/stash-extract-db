@@ -37,6 +37,7 @@ export interface RecordSummary {
   job_id: string;
   job_name: string;
   result_index: number;
+  record_id: string | null;
   id: string | null;
   title: string | null;
   details: string | null;
