@@ -182,7 +182,17 @@ async def init_db() -> None:
     global _db
     os.makedirs(settings.data_dir, exist_ok=True)
     db_path = os.path.join(settings.data_dir, "stash-extract-db.db")
-    _db = await aiosqlite.connect(db_path)
+    # isolation_level=None puts the connection in autocommit mode. The bridge
+    # shares one connection across concurrent tasks (lifecycle worker doing
+    # featurization DMLs while startup_discover seeds new jobs). With Python's
+    # default isolation_level="", every DML implicitly opens a transaction
+    # that stays open until commit() — so when one task is mid-DML and another
+    # task issues `BEGIN` for an explicit multi-statement transaction
+    # (upsert_job_and_results), sqlite errors with "cannot start a transaction
+    # within a transaction" and silently drops the second task's seed.
+    # Autocommit closes the implicit-txn window; explicit BEGIN/COMMIT pairs
+    # in upsert_job_and_results still work as expected.
+    _db = await aiosqlite.connect(db_path, isolation_level=None)
     await _db.execute("PRAGMA foreign_keys = ON")
     await _db.executescript(SCHEMA)
     await _db.commit()

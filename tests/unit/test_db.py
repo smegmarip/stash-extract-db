@@ -44,6 +44,30 @@ class TestSchema:
         assert "idx_features_lru" in idx
         assert "idx_extractor_results_uuid" in idx
 
+    async def test_unwrapped_dml_does_not_block_explicit_begin(self, bridge_db):
+        """Regression: in autocommit mode (isolation_level=None), a DML
+        without an explicit commit() does not leave an implicit transaction
+        open. A subsequent BEGIN must succeed.
+
+        Pre-fix: with the default isolation_level="", the INSERT below
+        opened an implicit transaction, and `BEGIN` raised
+        `sqlite3.OperationalError: cannot start a transaction within a
+        transaction`. That dropped the third job during startup_discover
+        when one task's mid-DML overlapped another task's
+        upsert_job_and_results.
+        """
+        conn = bridge_db.db()
+        now = datetime.utcnow().isoformat()
+        await conn.execute(
+            "INSERT INTO extractor_jobs(job_id, job_name, schema_id, completed_at, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            ("j_autocommit", "n", "s", now, now),
+        )
+        # Deliberately no explicit commit() here — autocommit handles it.
+        # If implicit-txn behavior had survived, the next BEGIN would error.
+        await conn.execute("BEGIN")
+        await conn.execute("ROLLBACK")
+
 
 # --- Record UUID --------------------------------------------------------
 
