@@ -17,7 +17,7 @@ from typing import Any, Optional
 from fastapi import APIRouter, HTTPException, Query
 
 from ..models import (
-    FragmentMatchRequest, UrlMatchRequest, NameMatchRequest,
+    FragmentMatchRequest, UrlMatchRequest, NameMatchRequest, RecordLookupRequest,
     ScrapeResult, SearchResult, StashStudioOut, StashPerformerOut,
 )
 from ..stash import client as stash_client
@@ -265,6 +265,7 @@ async def _record_to_scrape_result(
         Image=image_data_uri,
         Studio=StashStudioOut(Name=studio_name) if studio_name else None,
         Performers=performers_out,
+        remote_site_id=candidate.get("record_uuid") or None,
     )
 
 
@@ -316,13 +317,64 @@ async def match_by_url(req: UrlMatchRequest, debug: bool = Query(False)):
 @router.post("/name")
 async def match_by_name(req: NameMatchRequest, debug: bool = Query(False)):
     """For sceneByName — Stash passes a search query (no fragment, no scene id).
-    Synthesize a scene with title=name and run the engine. Forces 'search' mode."""
+    Synthesize a scene with title=name and run the engine. Forces 'search' mode.
+
+    Studio narrowing for this path lives on the scraper side (see
+    `stash-extract-scraper/scraper.py::name`) — when the scraper can
+    resolve the query to exactly one Stash scene by title, it calls
+    /match/fragment instead, picking up §5's job-name filter naturally.
+    Reaching this endpoint with `name` means resolution wasn't unique
+    (0 or >1 hits), and the spec is "search domain = all scene-shaped
+    jobs"."""
     if req.mode != "search":
         raise HTTPException(status_code=400, detail="/match/name requires mode=search")
     synth = {"id": "", "title": req.name, "details": "", "code": "", "date": None,
              "performers": [], "studio": None, "files": [{"basename": req.name, "fingerprints": []}],
              "paths": {}, "urls": []}
     return await _match_with_scene(synth, req, studio_for_filter=None, debug=debug)
+
+
+@router.post("/record")
+async def match_by_record(req: RecordLookupRequest):
+    """sceneByQueryFragment landing endpoint.
+
+    When search returns multiple candidates, each one carries
+    `remote_site_id = record_uuid`. Stash echoes that back when the user
+    picks one; the scraper forwards it here. We resolve the picked record
+    directly — no studio filter, no matching engine, just a uuid lookup
+    against `extractor_results` (CLAUDE.md §15.4).
+
+    Returns the same shape as scrape mode: a single ScrapeResult dict, or
+    `{}` if the record_uuid is unknown (cascade-purged, never existed,
+    typo). The studio echoed back is the JOB's name — that's the stable
+    job→studio mapping per §5; we don't have a Stash scene to source it
+    from in this flow.
+    """
+    rid = (req.record_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="record_id is required")
+    rec = await cdb.get_result_by_uuid(rid)
+    if not rec:
+        logger.info("record lookup: empty record_id=%r", rid)
+        return {}
+    # The job's name is the studio per §5's job-as-studio mapping.
+    job_name: Optional[str] = None
+    try:
+        job = await ex_client.get_job(rec["job_id"])
+        if job:
+            job_name = job.get("name") or None
+    except Exception as e:
+        logger.warning("record lookup: job %s name fetch failed :: %s", rec["job_id"], e)
+    alias_resolver = AliasResolver()
+    out = await _record_to_scrape_result(rec, job_name, alias_resolver)
+    d = out.model_dump(exclude_none=True)
+    if rec.get("record_uuid"):
+        d["record_id"] = rec["record_uuid"]
+    logger.info(
+        "record lookup: hit record_id=%s job=%s idx=%d",
+        rid, rec["job_id"], rec["result_index"],
+    )
+    return d
 
 
 # ---------- shared body -----------------------------------------------

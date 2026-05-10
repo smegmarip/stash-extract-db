@@ -163,8 +163,21 @@ def main():
         body_text = _post("/match/name", {**base, "name": name, "mode": "search"})
 
     elif mode_arg == "query":
-        # sceneByQueryFragment — user picked a search result; scrape it
-        if payload.get("id"):
+        # sceneByQueryFragment — Stash echoes the picked search result
+        # back here. Prefer the round-trip identifier the bridge stamped
+        # on the result over fuzzier hints (URL exact-match, scene-id
+        # rescrape) — those collapse multiple candidates onto the first
+        # hit when records share a URL or no URL came through.
+        # Stash's JSON casing for ScrapedScene fields isn't fully
+        # contractual across versions, so accept both forms.
+        rid = str(
+            payload.get("remote_site_id")
+            or payload.get("RemoteSiteID")
+            or ""
+        ).strip()
+        if rid:
+            body_text = _post("/match/record", {"record_id": rid})
+        elif payload.get("id"):
             body_text = _post("/match/fragment", {**base, "scene_id": str(payload["id"]), "mode": "scrape"})
         elif payload.get("url"):
             body_text = _post("/match/url", {**base, "url": str(payload["url"]), "mode": "scrape"})

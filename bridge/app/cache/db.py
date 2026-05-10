@@ -387,6 +387,37 @@ async def list_results(job_id: str) -> list[dict[str, Any]]:
     return out
 
 
+async def get_result_by_uuid(record_uuid: str) -> Optional[dict[str, Any]]:
+    """Look up an extractor record by its content-derived `record_uuid`
+    (CLAUDE.md §15.4). Returns None if no match.
+
+    Used by the sceneByQueryFragment round-trip (CLAUDE.md §17): the bridge
+    stamps `remote_site_id = record_uuid` on every search result, Stash echoes
+    it back when the user picks one, and this lookup resolves it without
+    re-running the matching engine."""
+    if not record_uuid:
+        return None
+    async with db().execute(
+        "SELECT job_id, result_index, page_url, data_json, record_uuid "
+        "FROM extractor_results WHERE record_uuid = ?",
+        (record_uuid,),
+    ) as cur:
+        row = await cur.fetchone()
+    if not row:
+        return None
+    try:
+        data = json.loads(row[3])
+    except Exception:
+        data = {}
+    return {
+        "job_id": row[0],
+        "result_index": row[1],
+        "page_url": row[2],
+        "data": data,
+        "record_uuid": row[4],
+    }
+
+
 # --- image_hashes ------------------------------------------------------
 
 async def get_image_hash(source: str, ref_id: str, fingerprint: str, algorithm: str, hash_size: int) -> Optional[str]:

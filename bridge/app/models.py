@@ -58,6 +58,20 @@ class ScrapeResult(BaseModel):
     Image: Optional[str] = None
     Studio: Optional[StashStudioOut] = None
     Performers: Optional[list[StashPerformerOut]] = None
+    # Round-trip identifier per Stash's ScrapedScene GraphQL type. When
+    # search returns multiple candidates and the user picks one, Stash
+    # echoes this value back via sceneByQueryFragment so the scraper can
+    # resolve to the exact picked record without re-matching. CLAUDE.md
+    # §17 covers the wider read-only flow; §15.4 covers identity.
+    remote_site_id: Optional[str] = None
+
+
+class RecordLookupRequest(BaseModel):
+    """Payload for /match/record — the sceneByQueryFragment landing
+    endpoint. record_id is the canonical content-derived identifier
+    (record_uuid; CLAUDE.md §15.4) the bridge stamped on the search
+    result the user picked."""
+    record_id: str
 
 
 class SearchResult(ScrapeResult):

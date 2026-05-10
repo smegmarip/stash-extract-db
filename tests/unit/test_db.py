@@ -156,6 +156,41 @@ class TestRecordUuid:
             row = await cur.fetchone()
         assert row[0] == bridge_db.compute_record_uuid("jOld", "https://o", 0, {"title": "o"})
 
+    async def test_get_by_uuid_resolves_picked_record(self, bridge_db):
+        """The sceneByQueryFragment round-trip lookup: stamp uuids on
+        every result, look one up, get exactly that record (not the
+        first hit). Two records sharing a page_url must still resolve
+        to themselves — that's the whole point versus a URL-based
+        round-trip."""
+        now = datetime.utcnow().isoformat()
+        shared_url = "https://shared.test/page"
+        await bridge_db.upsert_job_and_results(
+            job_id="jQ", job_name="Q", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[
+                {"page_url": shared_url, "data": {"title": "first", "id": "a"}},
+                {"page_url": shared_url, "data": {"title": "second", "id": "b"}},
+            ],
+        )
+        results = await bridge_db.list_results("jQ")
+        first, second = results[0], results[1]
+        assert first["record_uuid"] != second["record_uuid"]
+
+        hit = await bridge_db.get_result_by_uuid(second["record_uuid"])
+        assert hit is not None
+        assert hit["job_id"] == "jQ"
+        assert hit["result_index"] == 1
+        assert hit["data"]["title"] == "second"
+
+        hit = await bridge_db.get_result_by_uuid(first["record_uuid"])
+        assert hit is not None
+        assert hit["result_index"] == 0
+        assert hit["data"]["title"] == "first"
+
+    async def test_get_by_uuid_unknown_returns_none(self, bridge_db):
+        assert await bridge_db.get_result_by_uuid("0" * 16) is None
+        assert await bridge_db.get_result_by_uuid("") is None
+
     async def test_init_idempotent(self, bridge_db, tmp_path):
         """Running init_db on an already-initialized DB doesn't fail or
         duplicate tables."""
