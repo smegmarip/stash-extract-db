@@ -381,8 +381,8 @@ async def _match_with_scene(
 
     selected, used_filter = _select_jobs_by_studio(jobs, studio_for_filter)
     logger.info(
-        "match: studio_filter applied=%s scene_shaped_jobs=%d selected=%d",
-        used_filter, len(jobs), len(selected),
+        "match: studio_filter applied=%s studio=%r scene_shaped_jobs=%d selected=%d",
+        used_filter, studio_for_filter, len(jobs), len(selected),
     )
     if used_filter and not selected:
         # Per CLAUDE.md §5: studio set, no match → empty
