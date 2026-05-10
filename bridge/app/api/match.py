@@ -185,6 +185,28 @@ def _sanitize_text(s: Optional[str]) -> Optional[str]:
     return s or None
 
 
+# Stash's ScrapedSceneInput (GraphQL) carries `remote_site_id`, but the
+# Go `sceneInput` struct that Stash actually marshals into the script's
+# stdin for sceneByQueryFragment drops it. So the field round-trips
+# fine when we send it OUT, but Stash strips it before re-feeding it to
+# the scraper after the user picks a result — meaning candidates that
+# share a page_url (or where /match/url returns hits[0] for any reason)
+# all collapse onto the same record. Round-trip the record_uuid via a
+# URL fragment instead: fragments survive sceneInput's `url *string`
+# verbatim, and they aren't sent to servers, so the URL stays
+# functionally identical. See scraper.py::query for the parse side.
+_RECORD_URL_FRAGMENT = "#sx="
+
+
+def _stamp_record_url(d: dict[str, Any], record_uuid: str) -> None:
+    """Append `#sx=<uuid>` to d["URL"] in-place. No-op if URL is empty
+    (we have no field to attach to in that case — the result still
+    has remote_site_id set for clients that handle it natively)."""
+    url = d.get("URL")
+    if url and record_uuid:
+        d["URL"] = url + _RECORD_URL_FRAGMENT + record_uuid
+
+
 # Stash expects YYYY-MM-DD; extractors pass through whatever the source
 # site publishes — human-readable ("May 14 2021", "Tues May 14, 2021"),
 # multilingual ("14 mai 2021"), or compact numeric ("20151128",
@@ -305,6 +327,7 @@ async def match_by_url(req: UrlMatchRequest, debug: bool = Query(False)):
                 d["match_score"] = 1.0
                 if h.get("record_uuid"):
                     d["record_id"] = h["record_uuid"]
+                    _stamp_record_url(d, h["record_uuid"])
                 results.append(d)
             return results
 
@@ -508,6 +531,7 @@ async def _match_with_scene(
         d["match_score"] = round(score, 4)
         if cand.get("record_uuid"):
             d["record_id"] = cand["record_uuid"]
+            _stamp_record_url(d, cand["record_uuid"])
         if dbg is not None:
             d["_debug"] = dbg
         out.append(d)

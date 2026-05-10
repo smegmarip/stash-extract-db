@@ -225,13 +225,24 @@ def main():
         # on the result over fuzzier hints (URL exact-match, scene-id
         # rescrape) — those collapse multiple candidates onto the first
         # hit when records share a URL or no URL came through.
-        # Stash's JSON casing for ScrapedScene fields isn't fully
-        # contractual across versions, so accept both forms.
         rid = str(
             payload.get("remote_site_id")
             or payload.get("RemoteSiteID")
             or ""
         ).strip()
+        if not rid:
+            # Stash's `sceneInput` Go struct (the one marshalled to our
+            # stdin for sceneByQueryFragment) drops `remote_site_id`
+            # even though ScrapedSceneInput defines it. The bridge
+            # stamps the uuid into the URL fragment as a workaround
+            # (see match.py::_stamp_record_url); recover it here.
+            for u in (payload.get("url"), *(payload.get("urls") or [])):
+                if not u:
+                    continue
+                m = re.search(r"#sx=([0-9a-f]+)", str(u))
+                if m:
+                    rid = m.group(1)
+                    break
         if rid:
             body_text = _post("/match/record", {"record_id": rid})
         elif payload.get("id"):
