@@ -22,6 +22,18 @@ BRIDGE_URL = "http://host.docker.internal:13000"
 # automatically, so this only needs to cover a single round-trip.
 REQUEST_TIMEOUT_S = 90
 
+# Stash GraphQL endpoint, reached from inside Stash's process. The
+# scraper consults Stash on the sceneByName path: when a query string
+# resolves to exactly one scene, the scraper switches to /match/fragment
+# with that scene's id so the bridge's studio-narrowing kicks in
+# (CLAUDE.md §5). For Stash invoking us in-process, localhost is the
+# right default.
+STASH_URL = "http://localhost:9999"
+
+# API key from Stash settings → Security → Authentication. Leave empty
+# unless your Stash deployment enforces auth.
+STASH_API_KEY = ""
+
 # --- Per-request operational overrides (None → bridge default) ---
 
 # Image-matching mode. None = use bridge default (cover).

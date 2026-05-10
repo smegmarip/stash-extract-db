@@ -124,6 +124,55 @@ def _post(endpoint: str, body: dict) -> str:
         return "{}"
 
 
+def _resolve_scene_id_by_title(title: str):
+    """Stash's sceneByName payload is just `{name}` — no scene context,
+    so the bridge can't apply its CLAUDE.md §5 studio filter. Bridge that
+    gap here: ask Stash for scenes whose title equals the query string;
+    when exactly one matches, return its id so we can re-route through
+    /match/fragment (which carries studio narrowing). Returns None when
+    the lookup is ambiguous (0 or >1 hits), Stash is unreachable, or
+    auth fails — caller falls back to /match/name (unfiltered search).
+
+    Stdlib only, like the rest of the scraper. The community py_common
+    package is a richer alternative but introduces a `requests` and
+    config.ini dependency that breaks the §1 transport contract.
+    """
+    stash_url = (getattr(config, "STASH_URL", "") or "").rstrip("/")
+    if not stash_url:
+        return None
+    api_key = getattr(config, "STASH_API_KEY", "") or ""
+    query = (
+        "query FindScenesByTitle($filter: FindFilterType, $scene_filter: SceneFilterType) {"
+        "  findScenes(filter: $filter, scene_filter: $scene_filter) {"
+        "    count scenes { id }"
+        "  }"
+        "}"
+    )
+    payload = json.dumps({
+        "query": query,
+        "variables": {
+            "filter": {"per_page": 2},
+            "scene_filter": {"title": {"value": title, "modifier": "EQUALS"}},
+        },
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if api_key:
+        headers["ApiKey"] = api_key
+    req = urllib.request.Request(stash_url + "/graphql", data=payload, headers=headers, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT_S) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as e:
+        _eprint(f"scraper.py: stash title lookup failed :: {e}")
+        return None
+    fs = ((body.get("data") or {}).get("findScenes") or {})
+    scenes = fs.get("scenes") or []
+    if len(scenes) != 1:
+        return None
+    sid = scenes[0].get("id")
+    return str(sid) if sid is not None else None
+
+
 def _overrides() -> dict:
     """Operational overrides from config.py. None entries are dropped so
     the bridge can apply its own default. Anything not surfaced here is
@@ -155,12 +204,20 @@ def main():
         body_text = _post("/match/fragment", {**base, "scene_id": scene_id, "mode": "scrape"})
 
     elif mode_arg == "name":
-        # sceneByName — Stash passes a search query
+        # sceneByName — Stash passes a search query and nothing else.
+        # Try to resolve the title to a single Stash scene id first; if
+        # exactly one matches, route through /match/fragment so the
+        # bridge applies the §5 studio filter. Otherwise fall back to
+        # /match/name (unfiltered search across all scene-shaped jobs).
         name = str(payload.get("name") or "").strip()
         if not name:
             print("[]")
             return
-        body_text = _post("/match/name", {**base, "name": name, "mode": "search"})
+        scene_id = _resolve_scene_id_by_title(name)
+        if scene_id:
+            body_text = _post("/match/fragment", {**base, "scene_id": scene_id, "mode": "search"})
+        else:
+            body_text = _post("/match/name", {**base, "name": name, "mode": "search"})
 
     elif mode_arg == "query":
         # sceneByQueryFragment — Stash echoes the picked search result
