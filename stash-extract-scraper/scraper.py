@@ -124,6 +124,68 @@ def _post(endpoint: str, body: dict) -> str:
         return "{}"
 
 
+def _get_json(endpoint: str):
+    """GET against the bridge, return parsed JSON or None on any failure
+    (404, network, decode). Used for record-id resolution paths where a
+    miss is not an error — the caller decides what to do."""
+    url = config.BRIDGE_URL.rstrip("/") + endpoint
+    req = urllib.request.Request(
+        url, headers={"Accept": "application/json"}, method="GET",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=config.REQUEST_TIMEOUT_S) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except HTTPError as e:
+        if e.code != 404:
+            _eprint(f"scraper.py: bridge {url} returned HTTP {e.code}")
+        return None
+    except (URLError, json.JSONDecodeError, TimeoutError) as e:
+        _eprint(f"scraper.py: bridge GET {url} failed :: {e}")
+        return None
+
+
+# `#sx=<hex>` is the bridge's URL-fragment workaround for Stash dropping
+# `remote_site_id` on the sceneByQueryFragment payload (see
+# bridge match.py::_stamp_record_url, CLAUDE.md §15.4). Recoverable from
+# any URL Stash hands us, regardless of action.
+_SX_FRAGMENT = re.compile(r"#sx=([0-9a-f]+)")
+
+# Viewer deep-link path: `/records/<job_id>/<result_index>`. The viewer
+# (CLAUDE.md §17) renders one record per page at this route; pasting one
+# of these into Stash's "Scrape from URL" should resolve to the same
+# record without going through the matching engine.
+_VIEWER_RECORD_PATH = re.compile(r"/records/([^/?#]+)/(\d+)")
+
+
+def _record_id_from_url(url_in: str):
+    """Return a bridge record_id (uuid) when `url_in` carries one, else
+    None. Two carriers are recognized:
+
+    - `#sx=<hex>` URL fragment — stamped by the bridge on search results
+      so sceneByQueryFragment can round-trip through `/match/record`.
+    - viewer deep-link `/records/<job_id>/<result_index>` — manually
+      copied from the viewer UI; resolved via the bridge's admin lookup
+      to a record_id.
+
+    The viewer-URL form requires a bridge round-trip (admin GET); the
+    `#sx=` form is purely string parsing.
+    """
+    if not url_in:
+        return None
+    m = _SX_FRAGMENT.search(url_in)
+    if m:
+        return m.group(1)
+    m = _VIEWER_RECORD_PATH.search(url_in)
+    if m:
+        job_id, idx = m.group(1), m.group(2)
+        rec = _get_json(f"/api/admin/records/{job_id}/{idx}")
+        if isinstance(rec, dict):
+            rid = rec.get("record_id")
+            if isinstance(rid, str) and rid:
+                return rid
+    return None
+
+
 def _resolve_scene_id_by_title(title: str):
     """Stash's sceneByName payload is just `{name}` — no scene context,
     so the bridge can't apply its CLAUDE.md §5 studio filter. Bridge that
@@ -237,11 +299,9 @@ def main():
             # stamps the uuid into the URL fragment as a workaround
             # (see match.py::_stamp_record_url); recover it here.
             for u in (payload.get("url"), *(payload.get("urls") or [])):
-                if not u:
-                    continue
-                m = re.search(r"#sx=([0-9a-f]+)", str(u))
-                if m:
-                    rid = m.group(1)
+                resolved = _record_id_from_url(str(u or ""))
+                if resolved:
+                    rid = resolved
                     break
         if rid:
             body_text = _post("/match/record", {"record_id": rid})
@@ -254,12 +314,22 @@ def main():
             return
 
     elif mode_arg == "url":
-        # sceneByURL — Stash passes a URL
+        # sceneByURL — Stash passes a URL. Two manual-matching shortcuts
+        # ride on this entrypoint before the generic /match/url path:
+        # a `#sx=<uuid>` fragment carries a bridge-stamped record_id
+        # (same recovery as the `query` mode workaround), and a viewer
+        # deep-link `/records/<job_id>/<result_index>` resolves through
+        # the bridge's admin lookup. Either form short-circuits to
+        # /match/record for an exact, content-derived hit.
         url_in = str(payload.get("url") or "").strip()
         if not url_in:
             _emit({})
             return
-        body_text = _post("/match/url", {**base, "url": url_in, "mode": "scrape"})
+        rid = _record_id_from_url(url_in)
+        if rid:
+            body_text = _post("/match/record", {"record_id": rid})
+        else:
+            body_text = _post("/match/url", {**base, "url": url_in, "mode": "scrape"})
 
     else:
         _eprint(f"scraper.py: unknown mode {mode_arg!r}")
