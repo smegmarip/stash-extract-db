@@ -588,30 +588,70 @@ function CandidateRow({
   );
 }
 
+// navigator.clipboard is undefined in non-secure contexts (HTTP on a
+// non-localhost origin, which is how this viewer is typically reached over
+// a LAN). Fall back to a hidden-textarea + document.execCommand round-trip
+// so the button works regardless of origin.
+async function copyText(text: string): Promise<boolean> {
+  if (typeof navigator !== "undefined" && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // fall through to execCommand
+    }
+  }
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "0";
+    ta.style.left = "0";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}
+
 function RawJsonPanel({ data, request }: { data: unknown; request: object }) {
-  const [copied, setCopied] = useState(false);
+  const [copiedKey, setCopiedKey] = useState<"req" | "res" | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const reqText = JSON.stringify(request, null, 2);
   const resText = JSON.stringify(data, null, 2);
-  const copy = (text: string) => {
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
-    });
+  const copy = async (key: "req" | "res", text: string) => {
+    setError(null);
+    const ok = await copyText(text);
+    if (ok) {
+      setCopiedKey(key);
+      setTimeout(() => setCopiedKey((k) => (k === key ? null : k)), 1500);
+    } else {
+      setError("copy failed");
+      setTimeout(() => setError(null), 2500);
+    }
   };
   return (
     <details className="rounded-md border border-[var(--border)] bg-[var(--bg-secondary)]">
       <summary className="cursor-pointer px-4 py-2 text-sm font-medium select-none">
         Raw JSON
+        {error ? (
+          <span className="ml-2 text-xs text-rose-500">{error}</span>
+        ) : null}
       </summary>
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4 p-4 border-t border-[var(--border)]">
         <div>
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs text-[var(--text-secondary)]">Request</span>
             <button
-              onClick={() => copy(reqText)}
+              onClick={() => copy("req", reqText)}
               className="text-xs px-2 py-1 rounded bg-[var(--bg-tertiary)] hover:bg-[var(--border)]"
             >
-              {copied ? "copied" : "copy"}
+              {copiedKey === "req" ? "copied" : "copy"}
             </button>
           </div>
           <pre className="text-xs whitespace-pre-wrap break-words font-mono max-h-72 overflow-auto bg-[var(--bg-primary)] p-3 rounded">
@@ -622,10 +662,10 @@ function RawJsonPanel({ data, request }: { data: unknown; request: object }) {
           <div className="flex items-center justify-between mb-2">
             <span className="text-xs text-[var(--text-secondary)]">Response</span>
             <button
-              onClick={() => copy(resText)}
+              onClick={() => copy("res", resText)}
               className="text-xs px-2 py-1 rounded bg-[var(--bg-tertiary)] hover:bg-[var(--border)]"
             >
-              {copied ? "copied" : "copy"}
+              {copiedKey === "res" ? "copied" : "copy"}
             </button>
           </div>
           <pre className="text-xs whitespace-pre-wrap break-words font-mono max-h-72 overflow-auto bg-[var(--bg-primary)] p-3 rounded">
