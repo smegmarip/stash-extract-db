@@ -633,6 +633,7 @@ The PK shape stays `(job_id, result_index)` — that's load-bearing for cascade 
 | Storage growing without bound                 | §14.9 — LRU eviction loop disabled (`BRIDGE_STASH_FEATURE_BUDGET_BYTES=0`?) or interval too long. Stash-side rows are the unbounded class; extractor-side rows are job-cascade-bound.                                                                                                          |
 | Animated cover / record asset never matches   | §13.8.1 — (a) HEIF/AVIF assets are hard-skipped per §13.8 rule 4; nothing to debug. (b) Confirm `image_features` has `<job_id>:<ref>#frame_*` rows for the animated extractor ref — if absent, featurization saw the bytes as static (`is_animated_bytes` returned False) or PIL decode failed; treat as decode failure. (c) Average `count(synth_rows) / count(distinct_assets)` should be close to `BRIDGE_ANIMATED_FRAMES_MAX` for a corpus with mostly long animations; values much lower indicate truncated GIFs (rare) or featurization rerun with a stale code version (cache invalidation).                                          |
 | Performer missing from viewer Performers list | §17 — `performer_index` not populated for that job. Check `SELECT COUNT(*) FROM performer_index WHERE job_id='<job>'`. If empty, the populate hook in `upsert_job_and_results` either didn't run (job predates the schema migration) or the startup `backfill_performer_index()` task failed. Logs at startup show progress; re-run by deleting the row(s) and restarting the bridge. |
+| Blank / near-empty record returned as a match | §18 — a soft-404 leaked past the substantiveness filter, OR the cache was populated before the filter existed and the one-shot purge didn't run. Check startup logs for `soft-404 purge: dropped N row(s)`. To re-run manually: restart the bridge (the purge in `lifespan` is idempotent). To diagnose a specific record, fetch it via `/api/admin/records/{job_id}/{idx}` and inspect `data` — if it carries only `url` (or `url` + a generic title), the predicate should reject it; if it has ≥ 2 substantive fields, the filter is working as designed and the record is legitimately sparse. |
 
 ---
 
@@ -680,3 +681,21 @@ Tiebreak in all sorts: `(job_id, result_index)` ascending — the §10 determini
 - **Don't** gate the Records / Performers / Status pages on featurization state. The 503 path is for `/match/*`; browse views render unconditionally.
 - **Don't** invoke an `express.json()` body parser in the viewer's Express layer. Every POST is proxied; consuming the body locally starves http-proxy-middleware of the stream and the bridge sees an empty request.
 - **Don't** alias-collapse performers in the viewer. Browse-time fuzzy match diverges from match-time fuzzy match in confusing ways; case-insensitive equality is the documented v1 contract.
+
+---
+
+## 18. Soft-404 records are filtered at ingest
+
+> **Records lacking at least 2 substantive fields are dropped before they enter `extractor_results`. URL and `page_url` are not substantive — they're trivially captured for any HTTP 200 response, including soft-404 pages.**
+
+Sites like the Internet Archive return HTTP 200 for missing scenes. The extractor runs its regex pipeline against the chrome HTML and produces a record whose only populated fields are the URL (always captured) and possibly a generic page title (`<title>Wayback Machine</title>`). Without filtering, these records pollute scrape and search results: URL-equality on `/match/url` returns a soft-404 because it captured the input URL trivially; short-title exact match can fire when a scene title happens to overlap page-chrome strings; regex'd `data.id` from a URL path segment can fire Studio+Code spuriously.
+
+**The predicate** (`_is_substantive_record` in `bridge/app/cache/db.py`): count non-empty entries from `{id, title, details, date, cover_image, images[], performers[]}`. Strip whitespace from text fields; require list fields to contain at least one truthy entry. Return `True` iff the count reaches ≥ 2. The ≥ 2 threshold rejects URL+chrome-title combos (the single populated text field doesn't meet the bar) while passing legitimately-sparse real records (title+date, id+performers, cover_image+title).
+
+**Where it applies**:
+- `upsert_job_and_results` filters incoming results before they're inserted. Surviving records get gap-free `result_index` values (0, 1, 2…), so `image_features` ref_id math stays consistent.
+- `purge_soft_404_records()` runs once per startup in `lifespan` after `init_db()`. Idempotent; on a clean cache it's a no-op. For affected jobs, it rebuilds via `upsert_job_and_results`, firing the §14.5 cascade — `job_feature_state`, `corpus_stats`, `image_uniqueness`, and extractor-side `image_features` are cleared, and the lifecycle worker's `startup_recover` re-featurizes against the clean corpus.
+
+**Why this is not a calibrated value**: the threshold is structural, not empirical. ≥ 2 is the smallest count that defeats URL+chrome-title; higher thresholds (≥ 3) would lose legitimately-sparse records (e.g. a tracker page with only title + date). The field set is the §6 canonical schema minus `url`/`page_url` — there's nothing to tune.
+
+**Don't** add `url` or `page_url` to the substantive set — they're trivially captured by the extractor for any HTTP 200 and are exactly the signal a soft-404 produces. **Don't** count single text fields (title alone, details alone) as substantive — they're the most contaminated by page-chrome regex. **Don't** filter at match time instead of ingest time — that would leak soft-404s into `record_uuid` allocation, `performer_index` aggregation, and the `/api/admin/*` browse views. **Don't** remove the ≥ 2 rule in favor of "must have one media field" — text-only records can legitimately match via §3's Studio+Code or Exact Title tier.

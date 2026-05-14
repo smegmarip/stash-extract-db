@@ -106,8 +106,8 @@ class TestRecordUuid:
             job_id="jU", job_name="U", schema_id="s",
             completed_at=now, fetched_at=now,
             results=[
-                {"page_url": "https://a", "data": {"title": "a"}},
-                {"page_url": "https://b", "data": {"title": "b"}},
+                {"page_url": "https://a", "data": {"title": "a", "date": "2024-01-01"}},
+                {"page_url": "https://b", "data": {"title": "b", "date": "2024-01-02"}},
             ],
         )
         async with bridge_db.db().execute(
@@ -125,12 +125,12 @@ class TestRecordUuid:
         await bridge_db.upsert_job_and_results(
             job_id="jL", job_name="L", schema_id="s",
             completed_at=now, fetched_at=now,
-            results=[{"page_url": "https://x", "data": {"title": "x"}}],
+            results=[{"page_url": "https://x", "data": {"title": "x", "date": "2024-01-01"}}],
         )
         results = await bridge_db.list_results("jL")
         assert len(results) == 1
         assert results[0]["record_uuid"] == bridge_db.compute_record_uuid(
-            "jL", "https://x", 0, {"title": "x"}
+            "jL", "https://x", 0, {"title": "x", "date": "2024-01-01"}
         )
 
     async def test_migration_backfills_legacy_rows(self, bridge_db):
@@ -568,3 +568,240 @@ class TestNegativeFeatureCache:
             "extractor_image", "j1:ref", "fp", "phash", "phash:16",
         )
         assert failed is None
+
+
+# --- Soft-404 filtering (CLAUDE.md §18) ---------------------------------
+
+class TestSubstantivePredicate:
+    """The predicate decides whether a record is real-enough to cache.
+
+    Soft-404s reliably yield only URL + page-chrome title. The ≥2 fields rule
+    rejects those without burning legitimately-sparse records (title+date,
+    id+performers, etc.).
+    """
+
+    def test_empty_data_fails(self, bridge_db):
+        assert not bridge_db._is_substantive_record({})
+
+    def test_none_data_fails(self, bridge_db):
+        assert not bridge_db._is_substantive_record(None)
+
+    def test_title_only_fails(self, bridge_db):
+        # The canonical soft-404 chrome: <title>Wayback Machine</title>
+        assert not bridge_db._is_substantive_record({"title": "Wayback Machine"})
+
+    def test_details_only_fails(self, bridge_db):
+        assert not bridge_db._is_substantive_record({"details": "Page not found."})
+
+    def test_whitespace_title_fails(self, bridge_db):
+        # Strip-then-truthy guards against regex captures of empty <title> tags.
+        assert not bridge_db._is_substantive_record({"title": "   \n  "})
+
+    def test_title_plus_date_passes(self, bridge_db):
+        # Legitimately-sparse real record.
+        assert bridge_db._is_substantive_record(
+            {"title": "Real Scene", "date": "2024-01-15"}
+        )
+
+    def test_id_plus_performers_passes(self, bridge_db):
+        assert bridge_db._is_substantive_record(
+            {"id": "abc123", "performers": ["Real Name"]}
+        )
+
+    def test_cover_image_plus_title_passes(self, bridge_db):
+        assert bridge_db._is_substantive_record(
+            {"title": "Scene", "cover_image": "https://x/c.jpg"}
+        )
+
+    def test_empty_list_does_not_count(self, bridge_db):
+        # `performers: []` is "no performers", not a substantive signal.
+        assert not bridge_db._is_substantive_record(
+            {"title": "Scene", "performers": [], "images": []}
+        )
+
+    def test_list_of_empty_strings_does_not_count(self, bridge_db):
+        # Defensive: `["", ""]` is effectively empty.
+        assert not bridge_db._is_substantive_record(
+            {"title": "Scene", "performers": ["", ""]}
+        )
+
+    def test_url_only_record_fails(self, bridge_db):
+        # The page_url is on the wrapper, not in `data`; `data` for a true
+        # URL-only soft-404 is `{}`.
+        assert not bridge_db._is_substantive_record({})
+
+
+class TestSubstantiveFilterAtUpsert:
+    """Drops soft-404 rows before they ever enter `extractor_results`."""
+
+    async def test_filter_drops_non_substantive(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jF", job_name="F", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[
+                # Substantive — kept
+                {"page_url": "https://a", "data": {"title": "Real", "date": "2024-01-01"}},
+                # Soft-404 — dropped
+                {"page_url": "https://b", "data": {"title": "Wayback Machine"}},
+                # Substantive — kept
+                {"page_url": "https://c", "data": {"id": "x", "performers": ["P"]}},
+                # URL-only — dropped
+                {"page_url": "https://d", "data": {}},
+            ],
+        )
+        results = await bridge_db.list_results("jF")
+        assert len(results) == 2
+        # Survivors get gap-free result_index starting at 0.
+        assert [r["result_index"] for r in results] == [0, 1]
+        urls = {r["page_url"] for r in results}
+        assert urls == {"https://a", "https://c"}
+
+    async def test_filter_idempotent_uuid(self, bridge_db):
+        """record_uuid uses the post-filter result_index. Two upserts of the
+        same content produce the same uuids."""
+        now = datetime.utcnow().isoformat()
+        records = [
+            {"page_url": "https://a", "data": {"title": "Real", "date": "2024-01-01"}},
+            {"page_url": "https://b", "data": {"title": "Wayback Machine"}},
+            {"page_url": "https://c", "data": {"id": "x", "performers": ["P"]}},
+        ]
+        await bridge_db.upsert_job_and_results(
+            job_id="jI", job_name="I", schema_id="s",
+            completed_at=now, fetched_at=now, results=records,
+        )
+        uuids_first = [r["record_uuid"] for r in await bridge_db.list_results("jI")]
+        await bridge_db.upsert_job_and_results(
+            job_id="jI", job_name="I", schema_id="s",
+            completed_at=now, fetched_at=now, results=records,
+        )
+        uuids_second = [r["record_uuid"] for r in await bridge_db.list_results("jI")]
+        assert uuids_first == uuids_second
+
+    async def test_all_records_dropped_leaves_job_empty(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jE", job_name="E", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[
+                {"page_url": "https://a", "data": {}},
+                {"page_url": "https://b", "data": {"title": "Wayback Machine"}},
+            ],
+        )
+        # Job row exists, results empty.
+        cached = await bridge_db.get_cached_job("jE")
+        assert cached is not None
+        assert await bridge_db.list_results("jE") == []
+
+
+class TestPurgeSoft404Records:
+    """One-shot startup cleanup of legacy soft-404 rows."""
+
+    async def _seed_raw(self, bridge_db, job_id: str, records: list[dict]):
+        """Insert rows directly, bypassing the upsert filter — simulates
+        legacy data cached before §18 existed."""
+        import json as _json
+        now = datetime.utcnow().isoformat()
+        await bridge_db.db().execute(
+            "INSERT INTO extractor_jobs(job_id, job_name, schema_id, completed_at, fetched_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (job_id, job_id, "s", now, now),
+        )
+        for idx, r in enumerate(records):
+            data = r["data"]
+            uuid = bridge_db.compute_record_uuid(job_id, r["page_url"], idx, data)
+            await bridge_db.db().execute(
+                "INSERT INTO extractor_results(job_id, result_index, page_url, data_json, record_uuid) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (job_id, idx, r["page_url"], _json.dumps(data), uuid),
+            )
+        await bridge_db.db().commit()
+
+    async def test_purge_drops_offending_rows(self, bridge_db):
+        await self._seed_raw(bridge_db, "jP", [
+            {"page_url": "https://a", "data": {"title": "Real", "date": "2024-01-01"}},
+            {"page_url": "https://b", "data": {"title": "Wayback Machine"}},  # soft-404
+            {"page_url": "https://c", "data": {"id": "x", "performers": ["P"]}},
+        ])
+        dropped = await bridge_db.purge_soft_404_records()
+        assert dropped == 1
+        results = await bridge_db.list_results("jP")
+        assert len(results) == 2
+        # Survivors are re-indexed gap-free.
+        assert [r["result_index"] for r in results] == [0, 1]
+
+    async def test_purge_is_idempotent(self, bridge_db):
+        await self._seed_raw(bridge_db, "jI2", [
+            {"page_url": "https://a", "data": {"title": "Real", "date": "2024-01-01"}},
+            {"page_url": "https://b", "data": {}},
+        ])
+        first = await bridge_db.purge_soft_404_records()
+        assert first == 1
+        second = await bridge_db.purge_soft_404_records()
+        assert second == 0  # no offenders left
+
+    async def test_purge_noop_on_clean_cache(self, bridge_db):
+        # Going through the upsert filter means the cache is clean by
+        # construction; purge should report zero.
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jC", job_name="C", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[{"page_url": "https://a", "data": {"title": "T", "date": "2024-01-01"}}],
+        )
+        assert await bridge_db.purge_soft_404_records() == 0
+
+    async def test_purge_clears_feature_state_for_affected_job(self, bridge_db):
+        """The cascade in upsert_job_and_results fires when the purge rebuilds
+        the job, so job_feature_state for affected jobs is cleared. The
+        lifecycle worker's startup_recover will re-discover and re-featurize."""
+        await self._seed_raw(bridge_db, "jR", [
+            {"page_url": "https://a", "data": {"title": "Real", "date": "2024-01-01"}},
+            {"page_url": "https://b", "data": {}},
+        ])
+        await bridge_db.upsert_feature_state("jR", "ready", 1.0)
+        await bridge_db.set_corpus_stat("jR", "phash", "phash:8", 0.5)
+
+        await bridge_db.purge_soft_404_records()
+
+        cur = await bridge_db.db().execute(
+            "SELECT COUNT(*) FROM job_feature_state WHERE job_id='jR'"
+        )
+        assert (await cur.fetchone())[0] == 0
+        cur = await bridge_db.db().execute(
+            "SELECT COUNT(*) FROM corpus_stats WHERE job_id='jR'"
+        )
+        assert (await cur.fetchone())[0] == 0
+
+    async def test_purge_leaves_unaffected_jobs_untouched(self, bridge_db):
+        """A job whose records are all substantive must not be rebuilt — its
+        feature_state row should survive the purge."""
+        # Job A: clean
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="jA_clean", job_name="A", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[{"page_url": "https://a", "data": {"title": "T", "date": "2024-01-01"}}],
+        )
+        await bridge_db.upsert_feature_state("jA_clean", "ready", 1.0)
+
+        # Job B: dirty
+        await self._seed_raw(bridge_db, "jB_dirty", [
+            {"page_url": "https://b", "data": {"title": "Real", "date": "2024-01-01"}},
+            {"page_url": "https://b2", "data": {}},
+        ])
+
+        await bridge_db.purge_soft_404_records()
+
+        # A's feature_state survives
+        cur = await bridge_db.db().execute(
+            "SELECT state FROM job_feature_state WHERE job_id='jA_clean'"
+        )
+        row = await cur.fetchone()
+        assert row is not None and row[0] == "ready"
+
+        # B's feature_state is gone (cleared by the rebuild cascade)
+        cur = await bridge_db.db().execute(
+            "SELECT COUNT(*) FROM job_feature_state WHERE job_id='jB_dirty'"
+        )
+        assert (await cur.fetchone())[0] == 0

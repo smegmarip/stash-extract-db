@@ -229,6 +229,46 @@ async def get_cached_job(job_id: str) -> Optional[dict[str, Any]]:
             "completed_at": row[3], "fetched_at": row[4]}
 
 
+def _is_substantive_record(data: dict[str, Any]) -> bool:
+    """True iff a record carries ≥ 2 fields of structured content.
+
+    Filters soft-404s (CLAUDE.md §18). Sites like the Internet Archive return
+    HTTP 200 for missing pages, so the extractor scrapes them and produces
+    records that contain only the URL (always captured) plus generic page
+    chrome (e.g. <title>Wayback Machine</title>). These records pollute
+    scrape/search results because URL-equality, short-title exact match, or
+    regex'd `data.id` from URL path can fire spuriously.
+
+    Substantive fields (the §6 canonical schema, minus `url`/`page_url`
+    which is trivially captured for any HTTP 200):
+
+        id, title, details, date, cover_image, images[], performers[]
+
+    Requiring ≥ 2 passes legitimately-sparse records (id + performers,
+    title + date) while rejecting URL-only and URL+chrome-title soft-404s.
+    Single text fields are not enough — title and details are exactly the
+    fields most prone to regex contamination from page chrome.
+    """
+    if not isinstance(data, dict):
+        return False
+    count = 0
+    for key in ("id", "title", "details", "date", "cover_image"):
+        v = data.get(key)
+        if isinstance(v, str):
+            v = v.strip()
+        if v:
+            count += 1
+            if count >= 2:
+                return True
+    for key in ("images", "performers"):
+        v = data.get(key)
+        if isinstance(v, list) and any(v):
+            count += 1
+            if count >= 2:
+                return True
+    return count >= 2
+
+
 def _extract_performer_rows(
     job_id: str, result_index: int, data: dict[str, Any],
 ) -> list[tuple[str, int, str, str]]:
@@ -269,6 +309,23 @@ async def upsert_job_and_results(
     image_features rows survive — they're keyed by Stash content fingerprint,
     not by job, and remain valid across job changes.
     """
+    # Drop soft-404s before they enter the cache (CLAUDE.md §18). result_index
+    # is assigned over survivors only — gap-free indices keep image_features
+    # ref_id math (`<job_id>:<record_idx>`) consistent with the row's order.
+    filtered: list[dict[str, Any]] = []
+    dropped = 0
+    for r in results:
+        data = r.get("data") or {}
+        if _is_substantive_record(data):
+            filtered.append(r)
+        else:
+            dropped += 1
+    if dropped:
+        logger.info(
+            "upsert_job_and_results(%s): dropped %d non-substantive record(s)",
+            job_id, dropped,
+        )
+
     conn = db()
     await conn.execute("BEGIN")
     try:
@@ -279,7 +336,7 @@ async def upsert_job_and_results(
         )
         rows = []
         perf_rows: list[tuple[str, int, str, str]] = []
-        for idx, r in enumerate(results):
+        for idx, r in enumerate(filtered):
             page_url = r.get("page_url") or ""
             data = r.get("data") or {}
             data_json = json.dumps(data, ensure_ascii=False)
@@ -310,6 +367,68 @@ async def upsert_job_and_results(
     except Exception:
         await conn.rollback()
         raise
+
+
+async def purge_soft_404_records() -> int:
+    """One-shot startup cleanup of soft-404 records cached before the §18
+    filter was introduced. Idempotent — a second run on a clean cache is a
+    no-op.
+
+    Scans every cached `extractor_results` row. For each job that contains
+    at least one offending row, rebuilds the job via `upsert_job_and_results`
+    with only its substantive records. The standard cascade (§14.5) fires:
+    `job_feature_state`, `corpus_stats`, `image_uniqueness`, and
+    extractor-side `image_features` rows are cleared for the job, and the
+    startup lifecycle worker (`startup_recover`) will re-featurize it
+    against the cleaned corpus.
+
+    Cost: one-shot re-featurization for affected jobs only. Subsequent
+    runs of the bridge skip this work entirely.
+
+    Returns the number of records dropped.
+    """
+    affected: dict[str, dict[str, Any]] = {}
+    async with db().execute(
+        "SELECT job_id, result_index, page_url, data_json FROM extractor_results "
+        "ORDER BY job_id, result_index ASC"
+    ) as cur:
+        async for row in cur:
+            try:
+                data = json.loads(row[3])
+            except Exception:
+                data = {}
+            entry = affected.setdefault(row[0], {"survivors": [], "dropped": 0})
+            if _is_substantive_record(data):
+                entry["survivors"].append({"page_url": row[1], "data": data})
+            else:
+                entry["dropped"] += 1
+
+    jobs_with_drops = [jid for jid, e in affected.items() if e["dropped"] > 0]
+    if not jobs_with_drops:
+        return 0
+
+    total_dropped = sum(affected[jid]["dropped"] for jid in jobs_with_drops)
+    logger.info(
+        "soft-404 purge: %d job(s) carry %d offending row(s); rebuilding",
+        len(jobs_with_drops), total_dropped,
+    )
+    for job_id in jobs_with_drops:
+        job_row = await get_cached_job(job_id)
+        if job_row is None:
+            continue
+        await upsert_job_and_results(
+            job_id=job_id,
+            job_name=job_row["job_name"],
+            schema_id=job_row["schema_id"],
+            completed_at=job_row["completed_at"],
+            fetched_at=job_row["fetched_at"],
+            results=affected[job_id]["survivors"],
+        )
+    logger.info(
+        "soft-404 purge: dropped %d row(s) across %d job(s)",
+        total_dropped, len(jobs_with_drops),
+    )
+    return total_dropped
 
 
 async def backfill_performer_index() -> int:
