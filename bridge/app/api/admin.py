@@ -247,6 +247,40 @@ async def list_records(
     }
 
 
+# ----- /records/by-uuid/{record_id} -----------------------------------------
+# Declared BEFORE /records/{job_id}/{result_index} so the literal `by-uuid`
+# segment doesn't get captured as `job_id` and the uuid string parsed as
+# `result_index` (an int) — FastAPI matches routes in declaration order.
+
+@router.get("/records/by-uuid/{record_id}")
+async def get_record_by_uuid(record_id: str) -> dict[str, Any]:
+    """Lookup a record by its content-derived `record_uuid` (CLAUDE.md §15.4).
+    Same projection shape as /records/{job_id}/{result_index}; lets the
+    viewer deep-link from /match/* results (which carry record_id but not
+    job_id/result_index) into the canonical record-detail view.
+    """
+    rid = (record_id or "").strip()
+    if not rid:
+        raise HTTPException(status_code=400, detail="record_id is required")
+    async with cdb.db().execute(
+        "SELECT er.job_id, j.job_name, er.result_index, er.page_url, er.data_json, "
+        "       er.record_uuid, f.state, f.progress "
+        "FROM extractor_results er "
+        "JOIN extractor_jobs j ON j.job_id = er.job_id "
+        "LEFT JOIN job_feature_state f ON f.job_id = er.job_id "
+        "WHERE er.record_uuid = ?",
+        (rid,),
+    ) as cur:
+        row = await cur.fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="record not found")
+    return _project_record(
+        job_id=row[0], job_name=row[1], result_index=int(row[2]),
+        page_url=row[3], data_json=row[4], record_uuid=row[5],
+        feature_state=row[6], feature_progress=row[7],
+    )
+
+
 # ----- /records/{job_id}/{result_index} -------------------------------------
 
 @router.get("/records/{job_id}/{result_index}")

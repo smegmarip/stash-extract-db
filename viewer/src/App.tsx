@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 import Layout from "@/components/Layout";
 import RecordsPage from "@/pages/RecordsPage";
 import RecordDetailPage from "@/pages/RecordDetailPage";
+import RecordByUuidRedirect from "@/pages/RecordByUuidRedirect";
 import PerformersPage from "@/pages/PerformersPage";
 import PerformerDetailPage from "@/pages/PerformerDetailPage";
 import StatusPage from "@/pages/StatusPage";
@@ -14,6 +15,7 @@ export default function App() {
         <Route path="/" element={<Navigate to="/records" replace />} />
         <Route path="/records" element={<RecordsPage />} />
         <Route path="/records/:job_id/:result_index" element={<RecordDetailPage />} />
+        <Route path="/records/r/:record_id" element={<RecordByUuidRedirect />} />
         <Route path="/performers" element={<PerformersPage />} />
         <Route path="/performers/:name" element={<PerformerDetailPage />} />
         <Route path="/status" element={<StatusPage />} />

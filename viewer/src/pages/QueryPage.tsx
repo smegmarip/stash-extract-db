@@ -520,7 +520,18 @@ function CandidateRow({
           )}
         </td>
         <td className="px-3 py-2">
-          <div className="font-medium">{c.Title || "Untitled"}</div>
+          {c.record_id ? (
+            <a
+              href={`/records/r/${encodeURIComponent(c.record_id)}`}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="font-medium hover:underline"
+            >
+              {c.Title || "Untitled"}
+            </a>
+          ) : (
+            <div className="font-medium">{c.Title || "Untitled"}</div>
+          )}
           {c.Date ? (
             <div className="text-xs text-[var(--text-secondary)]">{c.Date}</div>
           ) : null}

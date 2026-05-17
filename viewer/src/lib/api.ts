@@ -178,6 +178,9 @@ export const api = {
   getRecord: (jobId: string, resultIndex: number) =>
     get<RecordSummary>(`/api/admin/records/${encodeURIComponent(jobId)}/${resultIndex}`),
 
+  getRecordByUuid: (recordId: string) =>
+    get<RecordSummary>(`/api/admin/records/by-uuid/${encodeURIComponent(recordId)}`),
+
   listPerformers: (params: PerformersListParams = {}) =>
     get<PaginatedResponse<PerformerSummary>>(`/api/admin/performers${buildQueryString(params)}`),
 
