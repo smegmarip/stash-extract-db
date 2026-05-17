@@ -117,6 +117,67 @@ class TestFeaturizeJob:
         )
         assert (await cur.fetchone())[0] == 2
 
+    async def test_refeaturize_skips_fetch_when_features_cached(
+        self, bridge_db, clean_settings, monkeypatch, synth_image,
+    ):
+        """Once per-channel features are cached for every required
+        channel × every (synth) ref of an asset, a subsequent
+        featurization run for the same job must NOT re-fetch that
+        asset. The fast path in featurize_one short-circuits before
+        the HTTP call. corpus_stats / image_uniqueness still get
+        recomputed (they cascade away and depend on the corpus)."""
+        from bridge.app.matching.featurization import featurize_job
+        from bridge.app.extractor import client as ex_client
+
+        fetch_counts: dict[str, int] = {}
+        asset_seeds = {"imgA": 1, "imgB": 2, "imgC": 3}
+
+        async def _fetch(job_id: str, ref: str):
+            fetch_counts[ref] = fetch_counts.get(ref, 0) + 1
+            seed = asset_seeds.get(ref)
+            return synth_image(seed) if seed is not None else None
+
+        def _resolve(job_id: str, ref: str) -> str:
+            return f"http://mock/{job_id}/{ref}"
+
+        monkeypatch.setattr(ex_client, "fetch_asset", _fetch)
+        monkeypatch.setattr(ex_client, "resolve_asset_url", _resolve)
+
+        records = [
+            {"data": {"id": "r0", "cover_image": "imgA", "images": ["imgB"]}},
+            {"data": {"id": "r1", "cover_image": "imgC", "images": []}},
+        ]
+        await _seed_job(bridge_db, "j_refetch", records)
+        await bridge_db.upsert_feature_state("j_refetch", "featurizing", 0.0)
+
+        # First run: slow path, every ref fetched once.
+        await featurize_job("j_refetch")
+        assert fetch_counts == {"imgA": 1, "imgB": 1, "imgC": 1}
+
+        # Simulate the cascade reset (corpus_stats + image_uniqueness +
+        # feature_state purged, image_features rows preserved per the new
+        # surgical-cleanup behavior).
+        await bridge_db.db().execute("DELETE FROM corpus_stats WHERE job_id='j_refetch'")
+        await bridge_db.db().execute("DELETE FROM image_uniqueness WHERE job_id='j_refetch'")
+        await bridge_db.db().execute("DELETE FROM job_feature_state WHERE job_id='j_refetch'")
+        await bridge_db.db().commit()
+        await bridge_db.upsert_feature_state("j_refetch", "featurizing", 0.0)
+
+        # Second run: fast path. No new fetches; counts unchanged.
+        await featurize_job("j_refetch")
+        assert fetch_counts == {"imgA": 1, "imgB": 1, "imgC": 1}, (
+            f"expected no re-fetch on second run, got {fetch_counts}"
+        )
+
+        # And the job is fully ready again, with corpus_stats / uniqueness
+        # rebuilt from the cached features.
+        s = await bridge_db.get_feature_state("j_refetch")
+        assert s["state"] == "ready"
+        cur = await bridge_db.db().execute(
+            "SELECT COUNT(*) FROM corpus_stats WHERE job_id='j_refetch'"
+        )
+        assert (await cur.fetchone())[0] >= 1
+
     async def test_uniqueness_penalizes_shared_refs(
         self, bridge_db, clean_settings, mock_extractor,
     ):

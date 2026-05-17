@@ -24,7 +24,7 @@ from .image_match import (
     CHANNEL_B_ALGO, CHANNEL_C_ALGO,
 )
 from .imgmatch import frames as _frames
-from .imgmatch.image_comparison import hash_distance_to_similarity
+from .imgmatch.image_comparison import hash_distance_to_similarity, hex_to_hash
 from .imgmatch.channels import (
     aggregate_color_hist, color_hist_similarity, tone_similarity,
     _color_hist_quality,
@@ -87,9 +87,59 @@ async def _featurize_inner(job_id: str) -> None:
     hash_size = settings.bridge_hash_size
     new_algo_a = _algo_key(algorithm, hash_size)
 
+    # Per-job pre-pass: build the animated-frame expansion map and bulk-load
+    # per-channel cache presence for every (synth) ref we'd otherwise fetch.
+    # A ref is "already featurized" iff every required (channel, algorithm)
+    # has a fingerprint-matched row for every synth_ref. The fast path in
+    # featurize_one below skips fetch + animatedness detection + compute
+    # when that holds, populating ref_hash_a / _b / _c directly from the
+    # bulk-fetched blobs so phase 2 (baseline / uniqueness) still has the
+    # data it needs. Negative-cache sentinel rows count as "tried" so we
+    # don't refetch refs that were known unfetchable.
+    frame_map = await cdb.bulk_list_frame_refs_for_job(job_id)
+
+    parent_to_synth_refs: dict[str, list[str]] = {}
+    ref_id_to_fp: dict[str, str] = {}
+    for parent_ref in original_ref_to_records:
+        synth_list = frame_map.get(parent_ref) or [parent_ref]
+        parent_fp = (
+            parent_ref if parent_ref.startswith("http")
+            else ex_client.resolve_asset_url(job_id, parent_ref)
+        )
+        parent_to_synth_refs[parent_ref] = synth_list
+        for s in synth_list:
+            ref_id_to_fp[f"{job_id}:{s}"] = parent_fp
+
+    required_channels: list[tuple[str, str]] = [
+        ("phash", new_algo_a),
+        ("color_hist", CHANNEL_B_ALGO),
+        ("tone", CHANNEL_C_ALGO),
+    ]
+    if settings.bridge_embedding_enabled:
+        from . import embedding as emb
+        required_channels.append(("embedding", emb.algorithm_key()))
+
+    cached_per_channel: dict[str, dict[str, tuple[bytes, float]]] = {}
+    for channel, alg in required_channels:
+        cached_per_channel[channel] = await cdb.bulk_get_image_features(
+            "extractor_image", channel, alg, ref_id_to_fp,
+        )
+
+    def _fully_cached(parent_ref: str) -> bool:
+        synth_list = parent_to_synth_refs.get(parent_ref)
+        if not synth_list:
+            return False
+        for s in synth_list:
+            rid = f"{job_id}:{s}"
+            for channel, _ in required_channels:
+                if rid not in cached_per_channel[channel]:
+                    return False
+        return True
+
     original_refs = list(original_ref_to_records.keys())
     total = len(original_refs)
     completed = [0]
+    n_skipped = [0]  # telemetry: refs that took the fast path
     sem = asyncio.Semaphore(settings.bridge_featurize_per_job_concurrency)
     ref_hash_a: dict[str, object] = {}     # imagehash objects
     ref_blob_b: dict[str, np.ndarray] = {}  # numpy uint8 hist
@@ -98,10 +148,43 @@ async def _featurize_inner(job_id: str) -> None:
     expanded: dict[str, list[str]] = {}
 
     async def featurize_one(original_ref: str) -> None:
-        """Fetch the asset once, detect animation, expand if needed, then
-        compute per-channel features per (synthetic) frame ref. Static
-        refs flow through with synth_refs == [original_ref]."""
+        """Featurize one parent asset.
+
+        Fast path: when every required channel is already cached for every
+        synth_ref this asset would produce, skip the HTTP fetch +
+        is_animated_bytes() detection + per-channel compute. Just load the
+        cached blobs into the in-memory dicts so phase 2 (aggregate,
+        baseline, uniqueness) has the data. Animatedness is recovered from
+        the cache itself (presence of `#frame_N` siblings — CLAUDE.md
+        §13.8.1's implicit marker).
+
+        Slow path: at least one channel is missing for some synth_ref →
+        fetch + detect + compute as before.
+        """
         async with sem:
+            if _fully_cached(original_ref):
+                synth_list = parent_to_synth_refs[original_ref]
+                if frame_map.get(original_ref):
+                    # Record the animated expansion so phase 2 sees the
+                    # post-expansion ref shape, matching the slow path's
+                    # `expanded[original_ref] = ...` write below.
+                    expanded[original_ref] = synth_list
+                for s in synth_list:
+                    rid = f"{job_id}:{s}"
+                    p_row = cached_per_channel["phash"].get(rid)
+                    if p_row and p_row[1] != cdb.NEGATIVE_CACHE_QUALITY:
+                        ref_hash_a[s] = hex_to_hash(p_row[0].hex())
+                    b_row = cached_per_channel["color_hist"].get(rid)
+                    if b_row and b_row[1] != cdb.NEGATIVE_CACHE_QUALITY:
+                        ref_blob_b[s] = np.frombuffer(b_row[0], dtype=np.uint8)
+                    c_row = cached_per_channel["tone"].get(rid)
+                    if c_row and c_row[1] != cdb.NEGATIVE_CACHE_QUALITY:
+                        ref_blob_c[s] = np.frombuffer(c_row[0], dtype=np.uint8)
+                n_skipped[0] += 1
+                completed[0] += 1
+                await cdb.set_feature_progress(job_id, 0.80 * (completed[0] / total))
+                return
+
             try:
                 data = await ex_client.fetch_asset(job_id, original_ref)
             except Exception as e:
@@ -168,6 +251,12 @@ async def _featurize_inner(job_id: str) -> None:
         await cdb.set_feature_progress(job_id, 0.80 * (completed[0] / total))
 
     await asyncio.gather(*(featurize_one(ref) for ref in original_refs))
+
+    if n_skipped[0]:
+        logger.info(
+            "featurize: job=%s skipped %d/%d ref(s) via cached-feature fast path",
+            job_id, n_skipped[0], total,
+        )
 
     # Now build the post-expansion ref↔record mappings used by aggregate /
     # baseline / uniqueness compute. Each animated original ref contributes
