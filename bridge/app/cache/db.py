@@ -914,3 +914,84 @@ async def list_frame_refs_for_extractor_ref(job_id: str, ref: str) -> list[str]:
             return 0
     out.sort(key=_idx)
     return out
+
+
+async def bulk_list_frame_refs_for_job(job_id: str) -> dict[str, list[str]]:
+    """Bulk variant of list_frame_refs_for_extractor_ref. Returns
+    {parent_ref: [synthetic_frame_refs in numeric order]} for every
+    animated extractor asset in this job in a single SQL query.
+
+    A parent_ref appears in the map iff at least one
+    `<job_id>:<parent_ref>#frame_N` row exists in image_features. Static
+    refs are absent; callers treat absence as "no expansion".
+
+    Used by the D-batch match path (CLAUDE.md §13.10) so iteration over a
+    candidate pool's refs doesn't issue one LIKE-prefix scan per ref.
+    """
+    prefix = f"{job_id}:"
+    plen = len(prefix)
+    by_parent: dict[str, list[tuple[int, str]]] = {}
+    async with db().execute(
+        "SELECT DISTINCT ref_id FROM image_features "
+        "WHERE source='extractor_image' AND ref_id LIKE ? || ':%'",
+        (job_id,),
+    ) as cur:
+        async for row in cur:
+            rid = row[0]
+            if not rid.startswith(prefix):
+                continue
+            rest = rid[plen:]
+            mark = rest.find("#frame_")
+            if mark < 0:
+                continue
+            parent = rest[:mark]
+            tail = rest[mark + len("#frame_"):]
+            try:
+                idx = int(tail)
+            except ValueError:
+                continue
+            by_parent.setdefault(parent, []).append((idx, rest))
+    return {p: [r for _, r in sorted(pairs)] for p, pairs in by_parent.items()}
+
+
+async def bulk_get_image_features(
+    source: str, channel: str, algorithm: str,
+    ref_id_to_fingerprint: dict[str, str],
+    *, batch_size: int = 500,
+) -> dict[str, tuple[bytes, float]]:
+    """Bulk variant of get_image_feature for many (ref_id, fingerprint)
+    pairs sharing one (source, channel, algorithm). One or more SQL
+    SELECTs with `ref_id IN (?, ?, ...)`, chunked at `batch_size` to stay
+    under SQLite's parameter limit.
+
+    Returns {ref_id: (feature_blob, quality)} for every ref_id whose row
+    exists AND whose stored fingerprint matches the expected fingerprint.
+    Missing keys = no row OR fingerprint mismatch. Negative-cache sentinel
+    rows ARE returned (quality == NEGATIVE_CACHE_QUALITY); callers check
+    quality to distinguish "tried-and-failed" from a real hit.
+
+    Does NOT update `last_accessed_at`. Bulk-read is currently used only
+    by the extractor-side D-batch path; extractor rows are not LRU-evicted
+    (CLAUDE.md §14.9). If extended to stash_* sources, add a touch step.
+    """
+    out: dict[str, tuple[bytes, float]] = {}
+    if not ref_id_to_fingerprint:
+        return out
+    ref_ids = list(ref_id_to_fingerprint.keys())
+    for start in range(0, len(ref_ids), batch_size):
+        chunk = ref_ids[start:start + batch_size]
+        placeholders = ",".join(["?"] * len(chunk))
+        sql = (
+            "SELECT ref_id, fingerprint, feature_blob, quality "
+            "FROM image_features "
+            "WHERE source=? AND channel=? AND algorithm=? "
+            f"AND ref_id IN ({placeholders})"
+        )
+        params = (source, channel, algorithm, *chunk)
+        async with db().execute(sql, params) as cur:
+            async for row in cur:
+                rid, fp, blob, quality = row[0], row[1], row[2], row[3]
+                if ref_id_to_fingerprint.get(rid) != fp:
+                    continue
+                out[rid] = (blob, quality)
+    return out

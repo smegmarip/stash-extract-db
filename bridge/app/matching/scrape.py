@@ -4,6 +4,7 @@ Cascade order: Studio+Code → Exact Title → Image (cheap-first; equivalent ou
 Returns a single record (dict with job_id, result_index, data) or None.
 """
 import logging
+import time
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -89,6 +90,7 @@ async def scrape(
     d_results: dict[tuple[str, int], dict[str, Any]] = {}
     cands_to_score = candidates
     cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
+    t_image_start = time.perf_counter()
     if use_d_batch:
         d_results = await score_image_channel_d_batch(
             scene, candidates, image_mode, sprite_sample_size,
@@ -173,18 +175,20 @@ async def scrape(
         if score > 0:
             matches.append((c, score))
 
+    image_elapsed_ms = 1000 * (time.perf_counter() - t_image_start)
+
     if matches:
         matches.sort(key=lambda m: (-m[1], m[0]["job_id"], m[0]["result_index"]))
         winner, score = matches[0]
         logger.info(
-            "scrape: tier=image fired=true job=%s idx=%d composite=%.3f n_passing=%d",
-            winner["job_id"], winner["result_index"], score, len(matches),
+            "scrape: tier=image fired=true job=%s idx=%d composite=%.3f n_passing=%d elapsed=%.0fms",
+            winner["job_id"], winner["result_index"], score, len(matches), image_elapsed_ms,
         )
         return winner
 
     logger.info(
-        "scrape: tier=image fired=false best_raw=%.3f (job=%s idx=%d) below threshold=%.3f",
-        raw_top[0], raw_top[1] or "-", raw_top[2], threshold,
+        "scrape: tier=image fired=false best_raw=%.3f (job=%s idx=%d) below threshold=%.3f elapsed=%.0fms",
+        raw_top[0], raw_top[1] or "-", raw_top[2], threshold, image_elapsed_ms,
     )
     logger.info("scrape: cascade exhausted, returning empty")
     return None

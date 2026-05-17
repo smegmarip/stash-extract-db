@@ -1276,11 +1276,19 @@ async def score_image_channel_d_batch(
     The win versus calling `score_image_channel_d` per candidate is structural:
     the scene's Stash-side embeddings are computed once, all extractor-side
     embeddings stack into one matrix, and one matmul produces the full
-    M × sum(N_i) similarity matrix. With 1500 candidates × 9 images and one
-    Stash scene, this is ~50 ms total.
+    M × sum(N_i) similarity matrix.
+
+    Extractor-side cache reads are bulked: one `bulk_list_frame_refs_for_job`
+    per unique job, then one (or a few) `bulk_get_image_features` calls
+    over every (ref_id, fingerprint) pair. Misses fall back to the
+    per-ref `extractor_image_embedding` path so the steady-state hot path
+    is O(unique_jobs + chunks) SQL roundtrips instead of O(sum_N).
     """
+    import time
     from . import embedding as emb
     import numpy as _np
+
+    t_start = time.perf_counter()
 
     # Stash side: encode once for the scene. Identical to the per-candidate
     # path; cached in image_features after first call.
@@ -1296,9 +1304,17 @@ async def score_image_channel_d_batch(
                 stash_blobs.append(sb)
     M = len(stash_blobs)
 
+    t_stash = time.perf_counter()
+
     # Empty Stash side → every candidate scores 0; short-circuit before
     # touching extractor embeddings.
     if M == 0:
+        logger.info(
+            "D-batch: n=%d M=0 → all-zero (stash=%.0fms total=%.0fms)",
+            len(candidates),
+            1000 * (t_stash - t_start),
+            1000 * (time.perf_counter() - t_start),
+        )
         return {
             (c["job_id"], c["result_index"]): {
                 "S": 0.0, "per_image_max": [], "extractor_refs": [],
@@ -1308,37 +1324,131 @@ async def score_image_channel_d_batch(
             for c in candidates
         }
 
-    # Extractor side: collect per-candidate slices. Track refs alongside
-    # blobs so the per-candidate dict can carry the same `extractor_refs`
-    # field as the per-candidate scorer (the dict is consumed by the debug
-    # envelope downstream).
-    offsets: list[tuple[int, int]] = []
+    # Pre-fetch animated-frame expansion maps once per unique job. Replaces
+    # the prior per-ref LIKE-prefix scan inside _expanded_extractor_refs.
+    unique_jobs = list({c["job_id"] for c in candidates})
+    frame_maps: dict[str, dict[str, list[str]]] = {}
+    for jid in unique_jobs:
+        try:
+            frame_maps[jid] = await cdb.bulk_list_frame_refs_for_job(jid)
+        except Exception as e:
+            # Defensive fallback (e.g. under unit-test stubs that monkeypatch
+            # _expanded_extractor_refs but don't initialise the DB). On
+            # error, leave frame_maps[jid] empty and the per-ref fallback
+            # below will still kick in.
+            logger.warning("D-batch: frame-ref prefetch failed job=%s :: %s", jid, e)
+            frame_maps[jid] = {}
+
+    # Build per-candidate expanded ref list using the in-memory map.
     refs_per_cand: list[list[str]] = []
-    all_blobs: list[bytes] = []
     for c in candidates:
-        refs: list[str] = list(c["data"].get("images") or [])
+        base: list[str] = list(c["data"].get("images") or [])
         cover = c["data"].get("cover_image")
-        if cover and cover not in refs:
-            refs = [cover] + refs
-        refs = await _expanded_extractor_refs(c["job_id"], refs)
+        if cover and cover not in base:
+            base = [cover] + base
+        fmap = frame_maps.get(c["job_id"], {})
+        expanded: list[str] = []
+        for r in base:
+            frames = fmap.get(r)
+            if frames:
+                expanded.extend(frames)
+            else:
+                expanded.append(r)
+        refs_per_cand.append(expanded)
+
+    t_expand = time.perf_counter()
+
+    # Build (ref_id, fingerprint) lookup for every (job, ref) participating.
+    # ref_id format matches extractor_image_embedding: f"{job_id}:{ref}".
+    # Fingerprint = resolved asset URL of the parent ref (synthetic frame
+    # refs share the parent asset's URL). Replicates _embedding_or_compute's
+    # fingerprint convention so bulk fetch hits the same rows.
+    algo = emb.algorithm_key()
+    ref_id_to_fp: dict[str, str] = {}
+    ref_ids_per_cand: list[list[str]] = []
+    for c, exp_refs in zip(candidates, refs_per_cand):
+        jid = c["job_id"]
+        ids: list[str] = []
+        for r in exp_refs:
+            ref_id = f"{jid}:{r}"
+            ids.append(ref_id)
+            if ref_id not in ref_id_to_fp:
+                parent = _parent_ref(r)
+                fp = parent if parent.startswith("http") else ex_client.resolve_asset_url(jid, parent)
+                ref_id_to_fp[ref_id] = fp
+        ref_ids_per_cand.append(ids)
+
+    try:
+        bulk_rows = await cdb.bulk_get_image_features(
+            "extractor_image", "embedding", algo, ref_id_to_fp,
+        )
+    except Exception as e:
+        # Same defensive posture as the frame-map prefetch: under stubbed
+        # tests or a degraded DB, fall through to the per-ref path.
+        logger.warning("D-batch: bulk embedding fetch failed :: %s", e)
+        bulk_rows = {}
+
+    t_bulk = time.perf_counter()
+
+    # Reassemble per-candidate slices. Cache hits (non-sentinel rows) come
+    # from the bulk fetch; misses fall back to extractor_image_embedding
+    # (which may compute on the fly — rare in steady state when
+    # featurization has already run).
+    offsets: list[tuple[int, int]] = []
+    kept_refs_per_cand: list[list[str]] = []
+    all_blobs: list[bytes] = []
+    n_hits = 0
+    n_sentinels = 0
+    n_misses = 0
+    for c, exp_refs, ref_ids in zip(candidates, refs_per_cand, ref_ids_per_cand):
         start = len(all_blobs)
         kept_refs: list[str] = []
-        for ref in refs:
-            try:
-                blob = await extractor_image_embedding(c["job_id"], ref)
-            except Exception as e:
-                logger.warning(
-                    "score D batch: extractor embed failed job=%s ref=%s :: %s",
-                    c["job_id"], ref, e,
-                )
-                blob = None
+        for ref, ref_id in zip(exp_refs, ref_ids):
+            row = bulk_rows.get(ref_id)
+            blob: Optional[bytes] = None
+            if row is not None:
+                blob_bytes, quality = row
+                if quality == cdb.NEGATIVE_CACHE_QUALITY:
+                    # Negative-cache sentinel: tried and failed previously;
+                    # don't retry on every match request.
+                    n_sentinels += 1
+                    continue
+                blob = bytes(blob_bytes)
+                n_hits += 1
+            else:
+                # True miss: fall through to per-ref path. This is the
+                # slow leg, but in steady state featurization has populated
+                # every ref so this branch shouldn't fire on production
+                # workloads.
+                n_misses += 1
+                try:
+                    blob = await extractor_image_embedding(c["job_id"], ref)
+                except Exception as e:
+                    logger.warning(
+                        "score D batch: extractor embed failed job=%s ref=%s :: %s",
+                        c["job_id"], ref, e,
+                    )
+                    blob = None
             if blob is not None:
                 all_blobs.append(blob)
                 kept_refs.append(ref)
         offsets.append((start, len(all_blobs)))
-        refs_per_cand.append(kept_refs)
+        kept_refs_per_cand.append(kept_refs)
+
+    t_load = time.perf_counter()
 
     if not all_blobs:
+        logger.info(
+            "D-batch: n=%d M=%d → no usable extractor blobs "
+            "(hits=%d sentinels=%d misses=%d | "
+            "stash=%.0fms expand=%.0fms bulk=%.0fms fallback=%.0fms total=%.0fms)",
+            len(candidates), M, n_hits, n_sentinels, n_misses,
+            1000 * (t_stash - t_start),
+            1000 * (t_expand - t_stash),
+            1000 * (t_bulk - t_expand),
+            1000 * (t_load - t_bulk),
+            1000 * (t_load - t_start),
+        )
         return {
             (c["job_id"], c["result_index"]): {
                 "S": 0.0, "per_image_max": [], "extractor_refs": [],
@@ -1353,8 +1463,10 @@ async def score_image_channel_d_batch(
     extr_mat = _np.stack([emb.blob_to_embedding(b) for b in all_blobs])      # (sum_N, D)
     sims = emb.cosine_sim_matrix(stash_mat, extr_mat)                        # (M, sum_N)
 
+    t_matmul = time.perf_counter()
+
     results: dict[tuple[str, int], dict[str, Any]] = {}
-    for (start, end), refs, c in zip(offsets, refs_per_cand, candidates):
+    for (start, end), refs, c in zip(offsets, kept_refs_per_cand, candidates):
         key = (c["job_id"], c["result_index"])
         if start == end:
             results[key] = {
@@ -1374,6 +1486,20 @@ async def score_image_channel_d_batch(
             "n_stash_hashes": M,
             "scoring": "embedding",
         }
+
+    t_end = time.perf_counter()
+    logger.info(
+        "D-batch: n=%d M=%d blobs=%d (hits=%d sentinels=%d misses=%d) | "
+        "stash=%.0fms expand=%.0fms bulk=%.0fms fallback=%.0fms matmul=%.0fms slice=%.0fms total=%.0fms",
+        len(candidates), M, len(all_blobs), n_hits, n_sentinels, n_misses,
+        1000 * (t_stash - t_start),
+        1000 * (t_expand - t_stash),
+        1000 * (t_bulk - t_expand),
+        1000 * (t_load - t_bulk),
+        1000 * (t_matmul - t_load),
+        1000 * (t_end - t_matmul),
+        1000 * (t_end - t_start),
+    )
     return results
 
 

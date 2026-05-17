@@ -14,6 +14,7 @@ record with 4 images scoring [0.1, 0.1, 0.1, 1.0] outranks one scoring
 the search image contribution — it applies only to scrape (CLAUDE.md §4).
 """
 import logging
+import time
 from typing import Any, Optional
 
 from fastapi import HTTPException
@@ -113,6 +114,7 @@ async def search(
     d_results: dict[tuple[str, int], dict[str, Any]] = {}
     top_k_keys: set[tuple[str, int]] = set()
     cached_d_per_cand: dict[tuple[str, int], dict[str, Any]] = {}
+    t_image_start = time.perf_counter()
     if use_d_batch:
         d_results = await score_image_channel_d_batch(
             scene, candidates, image_mode, sprite_sample_size,
@@ -282,4 +284,9 @@ async def search(
         scored.append((c, score, dbg))
 
     scored.sort(key=lambda t: (-t[1], t[0]["job_id"], t[0]["result_index"]))
+    image_elapsed_ms = 1000 * (time.perf_counter() - t_image_start)
+    logger.info(
+        "search: image tier complete n=%d returned=%d (limit=%d) elapsed=%.0fms",
+        n_cand, min(len(scored), limit), limit, image_elapsed_ms,
+    )
     return scored[:limit]

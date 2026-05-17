@@ -58,10 +58,23 @@ def fake_embedding_blobs(monkeypatch):
         # unchanged. The expansion machinery has its own coverage.
         return list(refs)
 
+    async def _empty_frame_map(job_id):
+        # D-batch's bulk frame-ref prefetch. Tests use no animated assets,
+        # so the map is empty and the per-ref path falls through.
+        return {}
+
+    async def _empty_bulk_features(source, channel, algorithm, ref_id_to_fp, **kwargs):
+        # D-batch's bulk extractor-embedding cache read. Tests have no
+        # real DB; return empty so every ref falls back to the stubbed
+        # extractor_image_embedding above.
+        return {}
+
     monkeypatch.setattr(im, "extractor_image_embedding", fake_extractor)
     monkeypatch.setattr(im, "stash_cover_embedding", fake_stash_cover)
     monkeypatch.setattr(im, "stash_sprite_embeddings", fake_stash_sprite)
     monkeypatch.setattr(im, "_expanded_extractor_refs", _identity_expand)
+    monkeypatch.setattr(im.cdb, "bulk_list_frame_refs_for_job", _empty_frame_map)
+    monkeypatch.setattr(im.cdb, "bulk_get_image_features", _empty_bulk_features)
 
     def install(stash_vec, ref_to_vec):
         state["stash"] = stash_vec
