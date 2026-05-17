@@ -304,10 +304,20 @@ async def upsert_job_and_results(
     Cascade per CLAUDE.md §7 + §14.5: deleting the
     extractor_jobs row cascades via FK to extractor_results, corpus_stats,
     image_uniqueness, job_feature_state, and performer_index (transitively
-    through extractor_results). match_results and the extractor-side
-    image_features rows have no FK and are deleted manually. Stash-side
-    image_features rows survive — they're keyed by Stash content fingerprint,
-    not by job, and remain valid across job changes.
+    through extractor_results). match_results has no FK and is deleted
+    manually.
+
+    Extractor-side image_features (`extractor_image`, `extractor_aggregate`)
+    are NOT purged wholesale. Their stored fingerprint is the resolved asset
+    URL, which is content-stable for the typical re-extraction case (most
+    page assets don't change between runs). Instead we drop only orphan
+    rows — refs that no longer appear in any new record's cover_image /
+    images[], and aggregates whose record_idx is out of range. Re-featurize
+    naturally reuses surviving rows; get_image_feature's fingerprint check
+    handles the rare same-URL-different-bytes case as a miss.
+
+    Stash-side image_features rows survive — they're keyed by Stash content
+    fingerprint, not by job, and remain valid across job changes.
     """
     # Drop soft-404s before they enter the cache (CLAUDE.md §18). result_index
     # is assigned over survivors only — gap-free indices keep image_features
@@ -325,6 +335,21 @@ async def upsert_job_and_results(
             "upsert_job_and_results(%s): dropped %d non-substantive record(s)",
             job_id, dropped,
         )
+
+    # Build the keep-set for the surgical orphan cleanup. `valid_parents`
+    # tracks every parent ref (no `#frame_N` suffix) that should survive;
+    # `valid_record_indices` tracks aggregate keys. Built before the
+    # transaction so the work doesn't bloat the BEGIN/COMMIT window.
+    valid_parents: set[str] = set()
+    valid_record_indices: set[int] = set()
+    for idx, r in enumerate(filtered):
+        data = r.get("data") or {}
+        cover = data.get("cover_image")
+        images = data.get("images") or []
+        for ref in [cover, *images]:
+            if ref and isinstance(ref, str):
+                valid_parents.add(ref)
+        valid_record_indices.add(idx)
 
     conn = db()
     await conn.execute("BEGIN")
@@ -355,14 +380,61 @@ async def upsert_job_and_results(
                 perf_rows,
             )
         await conn.execute("DELETE FROM match_results WHERE job_id = ?", (job_id,))
-        # Extractor-side image_features rows have no FK to extractor_jobs
-        # (Stash-side rows must survive); purge them manually.
-        await conn.execute(
-            "DELETE FROM image_features "
+
+        # Surgical orphan cleanup of extractor-side image_features. Scan
+        # this job's rows, drop the ones whose ref isn't in the new
+        # records. SQL can't strip the `#frame_N` suffix cleanly so we
+        # filter in Python; for typical job sizes (hundreds–thousands of
+        # rows) this is well under the BEGIN/COMMIT cost.
+        prefix = f"{job_id}:"
+        plen = len(prefix)
+        orphans_image: list[str] = []
+        orphans_aggregate: list[str] = []
+        async with conn.execute(
+            "SELECT source, ref_id FROM image_features "
             "WHERE source IN ('extractor_image', 'extractor_aggregate') "
             "  AND ref_id LIKE ? || ':%'",
             (job_id,),
-        )
+        ) as cur:
+            async for row in cur:
+                source, ref_id = row[0], row[1]
+                if not ref_id.startswith(prefix):
+                    continue
+                rest = ref_id[plen:]
+                if source == "extractor_image":
+                    mark = rest.find("#frame_")
+                    parent = rest[:mark] if mark >= 0 else rest
+                    if parent not in valid_parents:
+                        orphans_image.append(ref_id)
+                else:  # extractor_aggregate — ref_id = <job_id>:<record_idx>
+                    try:
+                        idx_val = int(rest)
+                    except ValueError:
+                        # Malformed aggregate ref_id; drop as orphan.
+                        orphans_aggregate.append(ref_id)
+                        continue
+                    if idx_val not in valid_record_indices:
+                        orphans_aggregate.append(ref_id)
+
+        # Chunked deletes (SQLite's parameter limit is 999 by default).
+        for source, orphans in (
+            ("extractor_image", orphans_image),
+            ("extractor_aggregate", orphans_aggregate),
+        ):
+            for i in range(0, len(orphans), 500):
+                batch = orphans[i:i + 500]
+                placeholders = ",".join(["?"] * len(batch))
+                await conn.execute(
+                    f"DELETE FROM image_features "
+                    f"WHERE source = ? AND ref_id IN ({placeholders})",
+                    (source, *batch),
+                )
+        if orphans_image or orphans_aggregate:
+            logger.info(
+                "upsert_job_and_results(%s): purged %d orphan image rows, "
+                "%d orphan aggregate rows (kept the rest for re-use)",
+                job_id, len(orphans_image), len(orphans_aggregate),
+            )
         await conn.commit()
     except Exception:
         await conn.rollback()

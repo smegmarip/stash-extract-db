@@ -256,6 +256,178 @@ class TestCascade:
         assert (await cur.fetchone())[0] == 1
 
 
+class TestCascadePreservesFeatures:
+    """The §14.5 cascade keeps extractor_image / extractor_aggregate rows
+    whose ref still appears in the new result set; only orphans are
+    purged. Lets a job re-run with mostly-unchanged assets skip
+    re-featurization of the unchanged subset."""
+
+    async def test_image_features_preserved_when_refs_unchanged(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        rec = {
+            "page_url": "p0",
+            "data": {
+                "id": "r0", "title": "T0",
+                "cover_image": "../assets/a.jpg",
+                "images": ["../assets/b.jpg"],
+            },
+        }
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=now, fetched_at=now, results=[rec],
+        )
+        await bridge_db.set_image_feature(
+            "extractor_image", "J:../assets/a.jpg", "fp_a",
+            "phash", "phash:16", b"hash_a", 0.5,
+        )
+        await bridge_db.set_image_feature(
+            "extractor_image", "J:../assets/b.jpg", "fp_b",
+            "phash", "phash:16", b"hash_b", 0.5,
+        )
+
+        # Re-upsert with same refs but advanced completed_at.
+        new_now = (datetime.utcnow() + timedelta(seconds=1)).isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=new_now, fetched_at=new_now, results=[rec],
+        )
+
+        # Both per-image features should survive.
+        feat_a = await bridge_db.get_image_feature(
+            "extractor_image", "J:../assets/a.jpg", "fp_a", "phash", "phash:16",
+        )
+        feat_b = await bridge_db.get_image_feature(
+            "extractor_image", "J:../assets/b.jpg", "fp_b", "phash", "phash:16",
+        )
+        assert feat_a is not None and feat_a[0] == b"hash_a"
+        assert feat_b is not None and feat_b[0] == b"hash_b"
+
+    async def test_orphan_image_feature_purged_when_ref_removed(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=now, fetched_at=now,
+            results=[{
+                "page_url": "p0",
+                "data": {
+                    "id": "r0", "title": "T0",
+                    "cover_image": "../assets/keep.jpg",
+                    "images": ["../assets/drop.jpg"],
+                },
+            }],
+        )
+        await bridge_db.set_image_feature(
+            "extractor_image", "J:../assets/keep.jpg", "fp_keep",
+            "phash", "phash:16", b"keep", 0.5,
+        )
+        await bridge_db.set_image_feature(
+            "extractor_image", "J:../assets/drop.jpg", "fp_drop",
+            "phash", "phash:16", b"drop", 0.5,
+        )
+
+        # Re-upsert; record now references only the "keep" ref.
+        new_now = (datetime.utcnow() + timedelta(seconds=1)).isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=new_now, fetched_at=new_now,
+            results=[{
+                "page_url": "p0",
+                "data": {
+                    "id": "r0", "title": "T0",
+                    "cover_image": "../assets/keep.jpg",
+                    "images": [],
+                },
+            }],
+        )
+
+        keep = await bridge_db.get_image_feature(
+            "extractor_image", "J:../assets/keep.jpg", "fp_keep",
+            "phash", "phash:16",
+        )
+        drop = await bridge_db.get_image_feature(
+            "extractor_image", "J:../assets/drop.jpg", "fp_drop",
+            "phash", "phash:16",
+        )
+        assert keep is not None and keep[0] == b"keep"
+        assert drop is None, "orphan ref should be purged"
+
+    async def test_animated_frame_siblings_preserved_with_parent(self, bridge_db):
+        # When the parent ref is kept, all `#frame_N` synthetic siblings
+        # in image_features should be kept too.
+        now = datetime.utcnow().isoformat()
+        rec = {
+            "page_url": "p0",
+            "data": {
+                "id": "r0", "title": "T0",
+                "cover_image": "../assets/anim.gif",
+                "images": [],
+            },
+        }
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=now, fetched_at=now, results=[rec],
+        )
+        for i in range(4):
+            await bridge_db.set_image_feature(
+                "extractor_image", f"J:../assets/anim.gif#frame_{i}", f"fp{i}",
+                "phash", "phash:16", f"hash{i}".encode(), 0.5,
+            )
+
+        new_now = (datetime.utcnow() + timedelta(seconds=1)).isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=new_now, fetched_at=new_now, results=[rec],
+        )
+
+        for i in range(4):
+            feat = await bridge_db.get_image_feature(
+                "extractor_image", f"J:../assets/anim.gif#frame_{i}", f"fp{i}",
+                "phash", "phash:16",
+            )
+            assert feat is not None, f"frame_{i} should survive"
+
+    async def test_aggregate_orphan_purged_when_record_idx_out_of_range(self, bridge_db):
+        now = datetime.utcnow().isoformat()
+        recs = [
+            {"page_url": f"p{i}", "data": {"id": f"r{i}", "title": f"T{i}",
+                                            "cover_image": f"../assets/{i}.jpg",
+                                            "images": []}}
+            for i in range(3)
+        ]
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=now, fetched_at=now, results=recs,
+        )
+        for i in range(3):
+            await bridge_db.set_image_feature(
+                "extractor_aggregate", f"J:{i}", "fp_agg",
+                "color_hist", "color_hist:hsv:4x4x4", b"agg", 0.5,
+            )
+
+        # Shrink to 1 record → aggregates J:1 and J:2 are orphans.
+        new_now = (datetime.utcnow() + timedelta(seconds=1)).isoformat()
+        await bridge_db.upsert_job_and_results(
+            job_id="J", job_name="n", schema_id="s",
+            completed_at=new_now, fetched_at=new_now, results=recs[:1],
+        )
+
+        kept = await bridge_db.get_image_feature(
+            "extractor_aggregate", "J:0", "fp_agg",
+            "color_hist", "color_hist:hsv:4x4x4",
+        )
+        dropped_1 = await bridge_db.get_image_feature(
+            "extractor_aggregate", "J:1", "fp_agg",
+            "color_hist", "color_hist:hsv:4x4x4",
+        )
+        dropped_2 = await bridge_db.get_image_feature(
+            "extractor_aggregate", "J:2", "fp_agg",
+            "color_hist", "color_hist:hsv:4x4x4",
+        )
+        assert kept is not None
+        assert dropped_1 is None
+        assert dropped_2 is None
+
+
 # --- image_features CRUD ------------------------------------------------
 
 class TestImageFeatures:

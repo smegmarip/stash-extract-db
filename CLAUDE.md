@@ -95,7 +95,7 @@ Users can clone, rename, or manually construct schemas. The seeded `"Video Scene
 | `extractor_results` rows                             | cascade from `extractor_jobs` (`ON DELETE CASCADE`)                                    |
 | `image_features` (Stash cover) / legacy `image_hashes` | `?t=<epoch>` query parameter on screenshot URL                                       |
 | `image_features` (Stash sprite) / legacy `image_hashes` | `oshash` from `files[].fingerprints`                                                |
-| `image_features` (extractor)                         | asset `etag` or `content_hash` response header                                         |
+| `image_features` (extractor)                         | resolved asset URL (stored as the row's `fingerprint`); orphaned by §14.5 surgical cleanup when no record references the parent ref |
 | `image_features` (`*_aggregate`)                     | composite of constituent ref strings; rebuilt on cascade                               |
 | `corpus_stats`                                       | cascade from `extractor_jobs` (`ON DELETE CASCADE`)                                    |
 | `image_uniqueness`                                   | cascade from `extractor_jobs` (`ON DELETE CASCADE`)                                    |
@@ -105,7 +105,7 @@ Users can clone, rename, or manually construct schemas. The seeded `"Video Scene
 
 **Don't** invalidate caches manually on a hunch. **Don't** add a TTL to any of these — TTLs hide bugs that the fingerprint-based invalidation would catch.
 
-When the extractor job's `completed_at` advances, all of: result rows, extractor-side image features and aggregates for that job, corpus stats, image uniqueness, job feature state, and match_results referencing that job — must be purged together. This is the one cross-table invalidation; treat it as an atomic transaction. After commit, the cascade trigger **enqueues a new featurization task for the job** (§14) — the bridge does not wait for the next request to discover the invalidation; it self-heals.
+When the extractor job's `completed_at` advances, all of: result rows, corpus stats, image uniqueness, job feature state, and match_results referencing that job — must be purged together. Extractor-side `image_features` rows (`source IN ('extractor_image', 'extractor_aggregate')`) are **not** wiped wholesale; only orphans (refs no longer reachable from any new record) are dropped (§14.5). This is the one cross-table invalidation; treat it as an atomic transaction. After commit, the cascade trigger **enqueues a new featurization task for the job** (§14) — the bridge does not wait for the next request to discover the invalidation; it self-heals.
 
 Stash-side `image_features` rows (`source IN ('stash_cover', 'stash_sprite', 'stash_aggregate')`) are **not** purged by this cascade — they're keyed by Stash content fingerprint, not by job, and remain valid across job changes. Stash-side rows are bounded by LRU eviction (§14).
 
@@ -482,22 +482,37 @@ When `extractor_jobs.completed_at` advances, the cascade is one atomic transacti
 
 ```
 ATOMIC TRANSACTION:
-    DELETE FROM extractor_results       WHERE job_id = ?
-    DELETE FROM image_features          WHERE source IN ('extractor_image', 'extractor_aggregate')
-                                          AND ref_id LIKE ? || ':%'
-    DELETE FROM corpus_stats            WHERE job_id = ?
-    DELETE FROM image_uniqueness        WHERE job_id = ?
-    DELETE FROM match_results           WHERE job_id = ?
-    DELETE FROM job_feature_state       WHERE job_id = ?
+    DELETE FROM extractor_jobs    WHERE job_id = ?   # FK-cascades to:
+                                                      #   extractor_results
+                                                      #   corpus_stats
+                                                      #   image_uniqueness
+                                                      #   job_feature_state
+                                                      #   performer_index (transitively)
     INSERT new extractor_jobs row
     INSERT new extractor_results rows
+    INSERT new performer_index rows
+    DELETE FROM match_results     WHERE job_id = ?
+
+    # Surgical orphan cleanup of extractor-side image_features:
+    # For every row WHERE source IN ('extractor_image', 'extractor_aggregate')
+    # AND ref_id LIKE '<job_id>:%', drop only those whose parent ref (the
+    # `<ref>` portion of `<job_id>:<ref>` or `<job_id>:<ref>#frame_N`) is
+    # absent from the new records' cover_image/images[]. Aggregate rows
+    # (`<job_id>:<record_idx>`) are dropped when record_idx is no longer
+    # in range of the new result set.
 COMMIT
 # then enqueue a fresh featurize_task for this job_id
 ```
 
-`performer_index` rows are NOT explicitly deleted here. They have `FOREIGN KEY (job_id, result_index) REFERENCES extractor_results(...) ON DELETE CASCADE`, so the `DELETE FROM extractor_results` line picks them up automatically via the FK chain. Don't add a manual DELETE — that would couple the viewer's display index to the matching cascade and create two sources of truth for the lifecycle.
+Per-image features for unchanged asset refs survive. `get_image_feature`'s fingerprint check then handles the rare same-URL-different-bytes case as an effective miss — the row is left in place but treated as stale on lookup, so the featurizer recomputes it. Asset filenames in the typical extractor are content-derived (e.g. `7c26ea4e1cfa_639.jpg`), making URL identity a strong proxy for byte identity; HEAD-checking each asset would buy nothing the naming scheme doesn't already provide and would re-introduce N sequential roundtrips on cascade.
+
+`corpus_stats` and `image_uniqueness` are FK-cascaded (still purged on every advance). Both depend on corpus composition; recomputing them from cached per-image features is fast — featurization re-runs against an already-cached image set skip the expensive fetch + per-channel compute loop and only redo the per-job aggregates.
+
+`performer_index` rows are not explicitly deleted here either. They have `FOREIGN KEY (job_id, result_index) REFERENCES extractor_results(...) ON DELETE CASCADE`, so the `DELETE FROM extractor_jobs` chain picks them up automatically via FK. Don't add a manual DELETE — that would couple the viewer's display index to the matching cascade and create two sources of truth for the lifecycle.
 
 Stash-side rows (`source IN ('stash_cover', 'stash_sprite', 'stash_aggregate')`) are not purged — see §7.
+
+**Don't** restore the wholesale `DELETE FROM image_features WHERE source IN ('extractor_image', 'extractor_aggregate') AND ref_id LIKE ?:%` that pre-dated this design. It threw away minutes-to-hours of compute on every `completed_at` advance for a corpus where most assets hadn't actually changed. The fingerprint-anchored cache is the contract that lets cascade be cheap.
 
 ### 14.6 Eager-startup recovery
 
