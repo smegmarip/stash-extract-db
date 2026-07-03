@@ -92,7 +92,10 @@ sceneByName:
   script: [python3, scraper.py, name]
 sceneByURL:
   - action: script
-    url: [""]                # users edit to scope to their archive sources
+    url:
+      - "#sx="             # bridge-stamped record id (written back on scrape apply)
+      - ":13100/records/"  # viewer deep-link (port = VIEWER_PORT)
+      # append archive source domains to route source-page URLs through /match/url
     script: [python3, scraper.py, url]
 ```
 

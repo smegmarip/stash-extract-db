@@ -26,11 +26,24 @@ sceneByQueryFragment:
     - query
 
 # Scrape by URL — used when a scene already has a URL set and the user
-# triggers "Scrape from URL". Edit the `url` list to scope to your sources.
+# triggers "Scrape from URL". Stash offers this scraper for any scene URL
+# that CONTAINS one of the strings below (plain substring match, no
+# wildcards). Keep patterns narrow: a catch-all like "http" claims every
+# URL and shadows every other installed scraper.
+#
+# The defaults cover the two URL shapes only this scraper understands:
+#   "#sx="            bridge-stamped record id, written back on scrape apply
+#   ":13100/records/" viewer deep-link (match the port to VIEWER_PORT if
+#                     you changed it from the compose default)
+#
+# To also route source-page URLs through the bridge's /match/url matching,
+# append your archive's domains, e.g.:
+#   - "web.archive.org"
 sceneByURL:
   - action: script
     url:
-      - "http"
+      - "#sx="
+      - ":13100/records/"
     script:
       - python3
       - scraper.py
